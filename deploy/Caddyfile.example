@@ -1,0 +1,11 @@
+# Caddyfile for SyncNow Self-Hosted Relay (Automatic HTTPS + WebSocket WSS)
+# Docker Compose defaults to upstream "syncnow-relay:8787".
+# On a bare-metal VPS, set RELAY_UPSTREAM=127.0.0.1:8787 (or edit the address directly).
+{$RELAY_DOMAIN:relay.example.com} {
+    encode zstd gzip
+
+    # Reverse proxy HTTP + WebSockets (/ws and /v1/signal/ws) seamlessly
+    reverse_proxy {$RELAY_UPSTREAM:syncnow-relay:8787} {
+        flush_interval -1
+    }
+}

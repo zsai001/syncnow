@@ -1,0 +1,32 @@
+name = "syncnow-relay"
+main = "cloudflare/src/index.ts"
+compatibility_date = "2025-05-01"
+preview_urls = false
+
+# Zero-setup SQLite Durable Objects (supported on Cloudflare Workers Free Plan!)
+# After one-click deploy finishes, open https://<your-worker>.workers.dev/setup
+# in your browser to bind your xtags.top owner account and configure policies visually.
+[durable_objects]
+bindings = [
+  { name = "RELAY_GROUP", class_name = "RelayGroupDO" },
+  { name = "SIGNALING_ROOM", class_name = "SignalingRoomDO" },
+  { name = "META_STORE", class_name = "MetaStoreDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelayGroupDO", "SignalingRoomDO", "MetaStoreDO"]
+
+# Optional: Uncomment after creating an R2 bucket (`wrangler r2 bucket create syncnow-blobs`)
+# for 25MB+ encrypted file blobs. Without R2, encrypted blobs automatically fall back to DO SQLite!
+# [[r2_buckets]]
+# binding = "BLOBS"
+# bucket_name = "syncnow-blobs"
+
+# Optional environment overrides (NOT needed for 1-click deploy — configure directly on /setup):
+# [vars]
+# SYNCNOW_AUTH_API = "https://api.xtags.top"
+# SYNCNOW_ALLOW_USERS = "usr_your_xtags_user_id"
+# SYNCNOW_MAX_ENVELOPES = "500"
+# SYNCNOW_MAX_BLOB_MB = "25"
+# SYNCNOW_BLOB_TTL_DAYS = "7"

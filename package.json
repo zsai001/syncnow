@@ -1,0 +1,19 @@
+{
+  "name": "syncnow-relay",
+  "version": "0.3.2",
+  "private": true,
+  "type": "module",
+  "description": "Self-hosted SyncNow E2EE Clipboard, File Blob & Same-Account Signaling Relay (Cloudflare Workers, Docker & VPS)",
+  "scripts": {
+    "dev": "wrangler dev --port 8787",
+    "build": "echo \"No pre-build step required (Wrangler bundles TypeScript directly)\"",
+    "typecheck": "tsc --noEmit",
+    "deploy": "wrangler deploy",
+    "deploy:dry-run": "wrangler deploy --dry-run --outdir=.wrangler-dry-run"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261123.1",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.168.0"
+  }
+}

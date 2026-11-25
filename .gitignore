@@ -1,0 +1,11 @@
+syncnow-relay
+/dist/
+data/
+.env
+node_modules/
+.wrangler/
+.wrangler-dry-run/
+cloudflare/node_modules/
+cloudflare/.wrangler/
+cloudflare/.wrangler-dry-run/
+.DS_Store

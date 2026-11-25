@@ -1,0 +1,25 @@
+[Unit]
+Description=SyncNow Self-Hosted E2EE Relay & Same-Account Signaling Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=syncnow
+Group=syncnow
+EnvironmentFile=-/etc/syncnow-relay.env
+ExecStart=/usr/local/bin/syncnow-relay
+WorkingDirectory=/var/lib/syncnow-relay
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=65536
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/syncnow-relay
+
+[Install]
+WantedBy=multi-user.target

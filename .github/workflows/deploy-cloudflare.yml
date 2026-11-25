@@ -1,0 +1,35 @@
+name: Deploy to Cloudflare Workers (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker_name:
+        description: 'Optional custom Cloudflare Worker name (leave empty for syncnow-relay)'
+        required: false
+        default: ''
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Apply optional custom worker name
+        if: ${{ inputs.worker_name != '' }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const name = process.argv[1].replace(/[^a-z0-9-]/gi, "-").toLowerCase();
+            let txt = fs.readFileSync("wrangler.toml", "utf8");
+            txt = txt.replace(/^name\s*=\s*"[^"]*"/m, `name = "${name}"`);
+            fs.writeFileSync("wrangler.toml", txt);
+          ' "${{ inputs.worker_name }}"
+      - name: Deploy directly via Wrangler (No Cloudflare GitHub App required)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler deploy

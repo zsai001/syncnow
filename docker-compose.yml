@@ -1,0 +1,53 @@
+services:
+  syncnow-relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: syncnow-relay:latest
+    container_name: syncnow-relay
+    restart: unless-stopped
+    ports:
+      - "${SYNCNOW_PORT:-8787}:8787"
+    environment:
+      SYNCNOW_RELAY_ADDR: ":8787"
+      SYNCNOW_RELAY_DATA: "/data"
+      # Unified xtags.top auth API (leave empty ONLY if you want static --token airgapped mode)
+      SYNCNOW_AUTH_API: "${SYNCNOW_AUTH_API:-https://api.xtags.top}"
+      # Optional: comma-separated xtags user IDs to strictly lock this relay to your own account(s)
+      SYNCNOW_ALLOW_USERS: "${SYNCNOW_ALLOW_USERS:-}"
+      # Optional: static bearer token for offline/airgapped mode (no xtags.top required)
+      SYNCNOW_RELAY_TOKEN: "${SYNCNOW_RELAY_TOKEN:-}"
+      # Optional: admin token for publishing /v1/admin/updates
+      SYNCNOW_ADMIN_TOKEN: "${SYNCNOW_ADMIN_TOKEN:-}"
+      SYNCNOW_MAX_ENVELOPES: "${SYNCNOW_MAX_ENVELOPES:-500}"
+      SYNCNOW_MAX_BLOB_MB: "${SYNCNOW_MAX_BLOB_MB:-25}"
+      SYNCNOW_BLOB_TTL_DAYS: "${SYNCNOW_BLOB_TTL_DAYS:-7}"
+    volumes:
+      - relay_data:/data
+    security_opt:
+      - no-new-privileges:true
+
+  # Optional automatic HTTPS/WSS reverse proxy via Caddy:
+  # Set RELAY_DOMAIN=relay.yourdomain.com in .env and run:
+  #   docker compose --profile tls up -d
+  caddy:
+    image: caddy:2-alpine
+    container_name: syncnow-relay-caddy
+    profiles: ["tls"]
+    restart: unless-stopped
+    depends_on:
+      - syncnow-relay
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      RELAY_DOMAIN: "${RELAY_DOMAIN:-relay.example.com}"
+    volumes:
+      - ./deploy/Caddyfile.example:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  relay_data:
+  caddy_data:
+  caddy_config:
