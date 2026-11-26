@@ -92,7 +92,7 @@ fi
 
 echo "==> 4. Deploying SyncNow Relay directly to Cloudflare Workers..."
 DEPLOY_LOG="$(mktemp "${TMPDIR:-/tmp}/syncnow-wrangler.XXXXXX")"
-npx wrangler deploy 2>&1 | tee "$DEPLOY_LOG"
+CI=true npx wrangler deploy 2>&1 | tee "$DEPLOY_LOG"
 WORKER_URL="$(grep -Eo 'https://[a-zA-Z0-9._-]+\.workers\.dev' "$DEPLOY_LOG" | head -n 1 || true)"
 rm -f "$DEPLOY_LOG"
 
