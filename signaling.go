@@ -20,6 +20,8 @@ type SignalPeerPresence struct {
 	DeviceName             string           `json:"deviceName"`
 	Platform               string           `json:"platform"`
 	SigningPublicKeyBase64 string           `json:"signingPublicKeyBase64"`
+	X25519PublicKeyBase64  string           `json:"x25519PublicKeyBase64,omitempty"`
+	X25519SignatureBase64  string           `json:"x25519SignatureBase64,omitempty"`
 	AccountCert            json.RawMessage  `json:"accountCert,omitempty"`
 	LANEndpoints           []SignalEndpoint `json:"lanEndpoints"`
 	ObservedPublicIP       string           `json:"observedPublicIP,omitempty"`
@@ -257,6 +259,17 @@ func (s *RelayServer) handleSignalWS(w http.ResponseWriter, r *http.Request) {
 				p.ObservedPublicIP = observedIP
 			}
 			targets, stored := s.signaling.updatePresence(principal.RoomID, deviceID, p)
+			if stored.SigningPublicKeyBase64 != "" {
+				s.groupVault.UpsertDevice(principal.RoomID, KnownAccountDevice{
+					DeviceID:               deviceID,
+					DeviceName:             stored.DeviceName,
+					Platform:               stored.Platform,
+					SigningPublicKeyBase64: stored.SigningPublicKeyBase64,
+					X25519PublicKeyBase64:  stored.X25519PublicKeyBase64,
+					X25519SignatureBase64:  stored.X25519SignatureBase64,
+					AccountCert:            stored.AccountCert,
+				})
+			}
 			upsertBytes, _ := json.Marshal(SignalServerMessage{
 				Type:   "peer_upsert",
 				UserID: principal.RoomID,

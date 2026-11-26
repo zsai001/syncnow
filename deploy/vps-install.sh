@@ -72,6 +72,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
   cat >"$ENV_FILE" <<EOF
 SYNCNOW_RELAY_ADDR=${SYNCNOW_RELAY_ADDR:-:8787}
 SYNCNOW_RELAY_DATA=${DATA_DIR}
+SYNCNOW_RUNTIME=linux-vps
 SYNCNOW_AUTH_API=${SYNCNOW_AUTH_API:-https://api.xtags.top}
 SYNCNOW_ALLOW_USERS=${SYNCNOW_ALLOW_USERS:-}
 SYNCNOW_RELAY_TOKEN=${SYNCNOW_RELAY_TOKEN:-}
@@ -79,6 +80,10 @@ SYNCNOW_ADMIN_TOKEN=${SYNCNOW_ADMIN_TOKEN:-}
 SYNCNOW_MAX_ENVELOPES=${SYNCNOW_MAX_ENVELOPES:-500}
 SYNCNOW_MAX_BLOB_MB=${SYNCNOW_MAX_BLOB_MB:-25}
 SYNCNOW_BLOB_TTL_DAYS=${SYNCNOW_BLOB_TTL_DAYS:-7}
+SYNCNOW_MAX_TMP_FILE_MB=${SYNCNOW_MAX_TMP_FILE_MB:-1024}
+SYNCNOW_MAX_TMP_TOTAL_MB=${SYNCNOW_MAX_TMP_TOTAL_MB:-8192}
+SYNCNOW_TMP_TTL_HOURS=${SYNCNOW_TMP_TTL_HOURS:-12}
+SYNCNOW_TMP_ACK_GRACE_MINUTES=${SYNCNOW_TMP_ACK_GRACE_MINUTES:-30}
 EOF
   chmod 0600 "$ENV_FILE"
   chown root:syncnow "$ENV_FILE"
@@ -98,7 +103,7 @@ ADDR_PORT="${ADDR_PORT:-8787}"
 echo "==> 5. Waiting up to 8s for relay HTTP readiness on port ${ADDR_PORT}..."
 READY=0
 for _ in 1 2 3 4 5 6 7 8; do
-  if command -v curl >/dev/null 2>&1 && curl --max-time 2 -fsS "http://127.0.0.1:${ADDR_PORT}/v1/updates/check" >/dev/null 2>&1; then
+  if command -v curl >/dev/null 2>&1 && curl --max-time 2 -fsS "http://127.0.0.1:${ADDR_PORT}/ping" >/dev/null 2>&1; then
     READY=1
     break
   fi

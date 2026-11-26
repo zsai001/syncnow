@@ -17,11 +17,12 @@ bindings = [
 tag = "v1"
 new_sqlite_classes = ["RelayGroupDO", "SignalingRoomDO", "MetaStoreDO"]
 
-# Optional: Uncomment after creating an R2 bucket (`wrangler r2 bucket create syncnow-blobs`)
-# for 25MB+ encrypted file blobs. Without R2, encrypted blobs automatically fall back to DO SQLite!
+# Optional: Uncomment after creating an R2 bucket (`wrangler r2 bucket create syncnow-tmp-blobs`)
+# for zero-egress multipart large-file temporary transfers (`/v1/tmp/*`, default 1 GB/file, 8 GB total).
+# Without R2, encrypted blobs & chunked `/v1/tmp/*` automatically fall back to DO SQLite!
 # [[r2_buckets]]
 # binding = "BLOBS"
-# bucket_name = "syncnow-blobs"
+# bucket_name = "syncnow-tmp-blobs"
 
 # Optional environment overrides (NOT needed for 1-click deploy — configure directly on /setup):
 # [vars]
@@ -30,3 +31,7 @@ new_sqlite_classes = ["RelayGroupDO", "SignalingRoomDO", "MetaStoreDO"]
 # SYNCNOW_MAX_ENVELOPES = "500"
 # SYNCNOW_MAX_BLOB_MB = "25"
 # SYNCNOW_BLOB_TTL_DAYS = "7"
+# SYNCNOW_MAX_TMP_FILE_MB = "1024"
+# SYNCNOW_MAX_TMP_TOTAL_MB = "8192"
+# SYNCNOW_TMP_TTL_HOURS = "12"
+# SYNCNOW_TMP_ACK_GRACE_MINUTES = "30"

@@ -69,6 +69,27 @@ if ! npx wrangler whoami >/dev/null 2>&1; then
   npx wrangler login
 fi
 
+R2_BUCKET_NAME="${R2_BUCKET_NAME:-syncnow-tmp-blobs}"
+if [[ "${SKIP_R2:-0}" != "1" ]]; then
+  echo "==> 3b. Probing Cloudflare R2 for large-file tmp storage ($R2_BUCKET_NAME)..."
+  if npx wrangler r2 bucket list 2>/dev/null | grep -q "$R2_BUCKET_NAME" || npx wrangler r2 bucket create "$R2_BUCKET_NAME" >/dev/null 2>&1; then
+    echo "✓ Cloudflare R2 bucket '$R2_BUCKET_NAME' is active — enabling zero-egress R2 tmp storage!"
+    node -e '
+      const fs = require("fs");
+      const bucket = process.argv[1];
+      let txt = fs.readFileSync("wrangler.toml", "utf8");
+      if (!/^\s*\[\[r2_buckets\]\]/m.test(txt)) {
+        txt += `\n[[r2_buckets]]\nbinding = "BLOBS"\nbucket_name = "${bucket}"\n`;
+        fs.writeFileSync("wrangler.toml", txt);
+      }
+    ' "$R2_BUCKET_NAME"
+    npx wrangler r2 bucket lifecycle add "$R2_BUCKET_NAME" "syncnow-tmp-safety-gc" "tmp/" --expire-days 3 --abort-multipart-days 1 --force >/dev/null 2>&1 || true
+  else
+    echo "ℹ R2 is not activated on this Cloudflare account yet; deploying with Free-Plan DO SQLite tmp fallback (128MB/file)."
+    echo "  (Tip: Enable R2 for free in Cloudflare Dashboard and re-run this command anytime to unlock 1GB+ R2 tmp relay!)"
+  fi
+fi
+
 echo "==> 4. Deploying SyncNow Relay directly to Cloudflare Workers..."
 DEPLOY_LOG="$(mktemp "${TMPDIR:-/tmp}/syncnow-wrangler.XXXXXX")"
 npx wrangler deploy 2>&1 | tee "$DEPLOY_LOG"

@@ -4,7 +4,11 @@
 {$RELAY_DOMAIN:relay.example.com} {
     encode zstd gzip
 
-    # Reverse proxy HTTP + WebSockets (/ws and /v1/signal/ws) seamlessly
+    request_body {
+        max_size 64MB
+    }
+
+    # Reverse proxy HTTP, streaming /v1/tmp/* chunks, and WebSockets (/ws, /v1/signal/ws, /v1/tunnel/ws)
     reverse_proxy {$RELAY_UPSTREAM:syncnow-relay:8787} {
         flush_interval -1
     }

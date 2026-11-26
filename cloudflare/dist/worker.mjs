@@ -3,7 +3,11 @@ var __name = (target, value) => __defProp(target, "name", { value, configurable:
 
 // cloudflare/src/types.ts
 var SAFE_ID_REGEX = /^[a-zA-Z0-9._-]{1,128}$/;
-var RELAY_VERSION = "0.3.2";
+var RELAY_VERSION = "0.4.0";
+var DEVICE_TOKEN_PREFIX = "snr_dev_";
+var DEFAULT_TMP_CHUNK_PLAIN_BYTES = 8 * 1024 * 1024;
+var TMP_CHUNK_AEAD_TAG_BYTES = 16;
+var MAX_TMP_CHUNKS_PER_TRANSFER = 2048;
 function jsonResponse(payload, status = 200, extraHeaders) {
   const headers = new Headers(extraHeaders);
   headers.set("Content-Type", "application/json");
@@ -18,14 +22,22 @@ __name(apiError, "apiError");
 // cloudflare/src/auth.ts
 var CACHE_VALID_TTL_MS = 5 * 60 * 1e3;
 var CACHE_INVALID_TTL_MS = 15 * 1e3;
+var DEVICE_TOKEN_CACHE_TTL_MS = 30 * 1e3;
 var CONFIG_CACHE_TTL_MS = 5 * 1e3;
 var tokenCache = /* @__PURE__ */ new Map();
+var deviceTokenCache = /* @__PURE__ */ new Map();
 var cachedRuntimeConfig = null;
+var cachedTicketSecretHex = null;
 var textEncoder = new TextEncoder();
+var textDecoder = new TextDecoder();
 function invalidateConfigCache() {
   cachedRuntimeConfig = null;
 }
 __name(invalidateConfigCache, "invalidateConfigCache");
+function invalidateDeviceTokenCache() {
+  deviceTokenCache.clear();
+}
+__name(invalidateDeviceTokenCache, "invalidateDeviceTokenCache");
 function extractBearerToken(request) {
   const auth = (request.headers.get("Authorization") || "").trim();
   if (auth.startsWith("Bearer ")) {
@@ -46,17 +58,92 @@ function constantTimeEqual(a, b) {
   return diff === 0;
 }
 __name(constantTimeEqual, "constantTimeEqual");
-async function hashTokenKey(token) {
-  const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(token));
+async function sha256Hex(input) {
+  const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(input));
   return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
-__name(hashTokenKey, "hashTokenKey");
+__name(sha256Hex, "sha256Hex");
+function toBase64Url(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+__name(toBase64Url, "toBase64Url");
+function fromBase64Url(str) {
+  try {
+    let b64 = str.replace(/-/g, "+").replace(/_/g, "/");
+    while (b64.length % 4 !== 0) b64 += "=";
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+}
+__name(fromBase64Url, "fromBase64Url");
+async function getTicketSecretHex(env) {
+  if (cachedTicketSecretHex) return cachedTicketSecretHex;
+  const metaStub = env.META_STORE.get(env.META_STORE.idFromName("global"));
+  const res = await metaStub.fetch("https://internal/internal/ticket-secret");
+  const data = await res.json();
+  cachedTicketSecretHex = data.secretHex;
+  return data.secretHex;
+}
+__name(getTicketSecretHex, "getTicketSecretHex");
+async function signTmpTicket(secretHex, claims) {
+  const payload = toBase64Url(textEncoder.encode(JSON.stringify(claims)));
+  const key = await crypto.subtle.importKey(
+    "raw",
+    textEncoder.encode(secretHex),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, textEncoder.encode(payload)));
+  return `v1.${payload}.${toBase64Url(sig)}`;
+}
+__name(signTmpTicket, "signTmpTicket");
+async function verifyTmpTicket(env, rawTicket, expectedTransferID, expectedGroupHash) {
+  const parts = (rawTicket || "").trim().split(".");
+  if (parts.length !== 3 || parts[0] !== "v1") return null;
+  const sigBytes = fromBase64Url(parts[2]);
+  const payloadBytes = fromBase64Url(parts[1]);
+  if (!sigBytes || !payloadBytes) return null;
+  const secretHex = await getTicketSecretHex(env);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    textEncoder.encode(secretHex),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+  const ok = await crypto.subtle.verify("HMAC", key, sigBytes, textEncoder.encode(parts[1]));
+  if (!ok) return null;
+  try {
+    const claims = JSON.parse(textDecoder.decode(payloadBytes));
+    if (claims.tid !== expectedTransferID) return null;
+    if (expectedGroupHash && claims.grp !== expectedGroupHash) return null;
+    if (Date.now() >= claims.exp) return null;
+    return claims;
+  } catch {
+    return null;
+  }
+}
+__name(verifyTmpTicket, "verifyTmpTicket");
 function defaultConfigFromEnv(env) {
   const allowUsers = (env.SYNCNOW_ALLOW_USERS || "").split(",").map((s) => s.trim()).filter(Boolean);
   const staticToken = (env.SYNCNOW_RELAY_TOKEN || "").trim();
   const authAPI = env.SYNCNOW_AUTH_API === void 0 ? "https://api.xtags.top" : env.SYNCNOW_AUTH_API.trim().replace(/\/+$/, "");
   const envConfigured = Boolean(staticToken || allowUsers.length > 0);
   const authMode = staticToken && !authAPI ? "static_token" : "xtags_owner";
+  const hasR2 = Boolean(env.BLOBS);
+  const defaultTmpFileMB = hasR2 ? 1024 : 128;
+  const defaultTmpTotalMB = hasR2 ? 8192 : 1024;
+  const defaultTmpTTLHours = hasR2 ? 12 : 4;
+  const parsedGrace = Number(env.SYNCNOW_TMP_ACK_GRACE_MINUTES ?? "30");
   return {
     initialized: envConfigured,
     siteName: "SyncNow Relay",
@@ -69,10 +156,35 @@ function defaultConfigFromEnv(env) {
     maxEnvelopes: Number(env.SYNCNOW_MAX_ENVELOPES || "500") || 500,
     maxBlobMB: Number(env.SYNCNOW_MAX_BLOB_MB || "25") || 25,
     blobTTLDays: Number(env.SYNCNOW_BLOB_TTL_DAYS || "7") || 7,
+    maxTmpFileMB: Number(env.SYNCNOW_MAX_TMP_FILE_MB || String(defaultTmpFileMB)) || defaultTmpFileMB,
+    maxTmpTotalMB: Number(env.SYNCNOW_MAX_TMP_TOTAL_MB || String(defaultTmpTotalMB)) || defaultTmpTotalMB,
+    tmpTTLHours: Number(env.SYNCNOW_TMP_TTL_HOURS || String(defaultTmpTTLHours)) || defaultTmpTTLHours,
+    tmpAckGraceMinutes: Number.isFinite(parsedGrace) && parsedGrace >= -1 ? parsedGrace : 30,
     updatedAtMs: 0
   };
 }
 __name(defaultConfigFromEnv, "defaultConfigFromEnv");
+function normalizeRuntimeConfig(raw, env) {
+  const base = defaultConfigFromEnv(env);
+  const maxTmpFileMB = raw.maxTmpFileMB && raw.maxTmpFileMB > 0 ? raw.maxTmpFileMB : base.maxTmpFileMB;
+  const rawTotal = raw.maxTmpTotalMB && raw.maxTmpTotalMB > 0 ? raw.maxTmpTotalMB : base.maxTmpTotalMB;
+  const maxTmpTotalMB = Math.max(maxTmpFileMB, rawTotal);
+  const tmpTTLHours = raw.tmpTTLHours && raw.tmpTTLHours > 0 ? raw.tmpTTLHours : base.tmpTTLHours;
+  const tmpAckGraceMinutes = raw.tmpAckGraceMinutes !== void 0 && Number.isFinite(raw.tmpAckGraceMinutes) && raw.tmpAckGraceMinutes >= -1 ? raw.tmpAckGraceMinutes : base.tmpAckGraceMinutes;
+  return {
+    ...base,
+    ...raw,
+    allowUsers: Array.isArray(raw.allowUsers) ? raw.allowUsers : base.allowUsers,
+    maxEnvelopes: raw.maxEnvelopes && raw.maxEnvelopes > 0 ? raw.maxEnvelopes : base.maxEnvelopes,
+    maxBlobMB: raw.maxBlobMB && raw.maxBlobMB > 0 ? raw.maxBlobMB : base.maxBlobMB,
+    blobTTLDays: raw.blobTTLDays && raw.blobTTLDays > 0 ? raw.blobTTLDays : base.blobTTLDays,
+    maxTmpFileMB,
+    maxTmpTotalMB,
+    tmpTTLHours,
+    tmpAckGraceMinutes
+  };
+}
+__name(normalizeRuntimeConfig, "normalizeRuntimeConfig");
 async function loadRuntimeConfig(env, bypassCache = false) {
   const now = Date.now();
   if (!bypassCache && cachedRuntimeConfig && now < cachedRuntimeConfig.expiresAtMs) {
@@ -83,7 +195,7 @@ async function loadRuntimeConfig(env, bypassCache = false) {
   let cfg;
   if (res.ok) {
     const stored = await res.json().catch(() => null);
-    cfg = stored ?? defaultConfigFromEnv(env);
+    cfg = stored ? normalizeRuntimeConfig(stored, env) : defaultConfigFromEnv(env);
   } else {
     cfg = defaultConfigFromEnv(env);
   }
@@ -91,8 +203,38 @@ async function loadRuntimeConfig(env, bypassCache = false) {
   return cfg;
 }
 __name(loadRuntimeConfig, "loadRuntimeConfig");
+async function verifyDeviceToken(env, rawToken) {
+  const tokenHash = await sha256Hex(rawToken);
+  const now = Date.now();
+  const cached = deviceTokenCache.get(tokenHash);
+  if (cached && now < cached.expiresAtMs) {
+    return cached.valid ? cached.roomID : null;
+  }
+  const metaStub = env.META_STORE.get(env.META_STORE.idFromName("global"));
+  const res = await metaStub.fetch("https://internal/internal/device-tokens/verify", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tokenHash })
+  });
+  if (!res.ok) {
+    deviceTokenCache.set(tokenHash, { valid: false, roomID: "", expiresAtMs: now + 1e4 });
+    return null;
+  }
+  const data = await res.json();
+  if (!data.valid || !data.record?.roomID) {
+    deviceTokenCache.set(tokenHash, { valid: false, roomID: "", expiresAtMs: now + 1e4 });
+    return null;
+  }
+  deviceTokenCache.set(tokenHash, {
+    valid: true,
+    roomID: data.record.roomID,
+    expiresAtMs: now + DEVICE_TOKEN_CACHE_TTL_MS
+  });
+  return data.record.roomID;
+}
+__name(verifyDeviceToken, "verifyDeviceToken");
 async function verifyXTagsTokenDirect(apiBase, rawToken, allowedUsers) {
-  const cacheKey = `${apiBase}:${await hashTokenKey(rawToken)}`;
+  const cacheKey = `${apiBase}:${await sha256Hex(rawToken)}`;
   const now = Date.now();
   const cached = tokenCache.get(cacheKey);
   if (cached && now < cached.expiresAtMs) {
@@ -196,7 +338,7 @@ function putCache(key, entry) {
 __name(putCache, "putCache");
 async function isSetupAdmin(request, cfg) {
   const token = extractBearerToken(request);
-  if (!token) return false;
+  if (!token || token.startsWith(DEVICE_TOKEN_PREFIX)) return false;
   if (cfg.adminToken && constantTimeEqual(token, cfg.adminToken)) return true;
   if (cfg.staticToken && constantTimeEqual(token, cfg.staticToken)) return true;
   if (cfg.authAPI && cfg.ownerUserID) {
@@ -214,6 +356,13 @@ async function authenticateRequest(request, env) {
   const allowedUsers = cfg.authMode === "xtags_owner" && cfg.allowUsers.length > 0 ? new Set(cfg.allowUsers) : /* @__PURE__ */ new Set();
   if (staticToken && token && constantTimeEqual(token, staticToken)) {
     return { principal: { roomID: "static-owner", user: null, mode: "static_token" }, cfg };
+  }
+  if (token.startsWith(DEVICE_TOKEN_PREFIX)) {
+    const roomID = await verifyDeviceToken(env, token);
+    if (roomID) {
+      return { principal: { roomID, user: null, mode: "device_token" }, cfg };
+    }
+    return { cfg, errorResponse: apiError(401, "unauthorized", "invalid or revoked device token") };
   }
   if (authAPI && token) {
     const { user, errorResponse } = await verifyXTagsTokenDirect(authAPI, token, allowedUsers);
@@ -328,10 +477,26 @@ var SETUP_UI_HTML = `<!DOCTYPE html>
     .mode-card .title { font-size: 13.5px; font-weight: 700; margin-bottom: 4px; }
     .mode-card .desc { font-size: 11.5px; color: var(--muted); line-height: 1.4; }
     label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 12px 0 6px; }
-    input[type="text"], input[type="password"], input[type="number"], textarea {
+    input[type="text"], input[type="password"], input[type="number"], select, textarea {
       width: 100%; padding: 10px 12px; border-radius: 10px;
       border: 1px solid var(--border); background: var(--card-2); color: var(--text);
       font-size: 13.5px; outline: none; font-family: inherit;
+    }
+    .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+    .chip {
+      padding: 4px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600;
+      border: 1px solid var(--border); background: var(--card-2); color: var(--muted);
+      cursor: pointer;
+    }
+    .chip:hover { border-color: var(--accent); color: var(--text); }
+    .bar-track {
+      width: 100%; height: 8px; border-radius: 999px; background: rgba(148, 163, 184, 0.18);
+      overflow: hidden; margin-top: 8px;
+    }
+    .bar-fill {
+      height: 100%; border-radius: 999px;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+      transition: width 0.25s ease;
     }
     input.mono, textarea.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     input:focus, textarea:focus { border-color: var(--accent); }
@@ -448,8 +613,58 @@ var SETUP_UI_HTML = `<!DOCTYPE html>
         </div>
       </div>
 
+      <!-- Tmp Large File Storage & Expiration Policy -->
+      <div style="margin-top:16px; padding:14px; border-radius:13px; border:1px solid var(--border); background:var(--card-2);">
+        <div style="font-size:13px; font-weight:700; margin-bottom:2px;" data-i18n="tmpSectionTitle">3. \u4E34\u65F6\u5927\u6587\u4EF6\u4E2D\u8F6C (Tmp) \u5927\u5C0F\u4E0E\u4FDD\u7559\u671F\u9650</div>
+        <div style="font-size:12px; color:var(--muted); margin-bottom:10px;" id="setupTmpBackendHint">\u5206\u5757\u6D41\u5F0F\u7AEF\u5230\u7AEF\u52A0\u5BC6\u4E2D\u8F6C\uFF088MiB/\u7247\uFF09\uFF0C\u5230\u671F\u6216\u7B7E\u6536\u540E\u81EA\u52A8\u6E05\u7406\u91CA\u653E\u7A7A\u95F4\u3002</div>
+        <div class="grid-2">
+          <div>
+            <label data-i18n="maxTmpFileLabel">\u5355\u6587\u4EF6\u5927\u5C0F\u4E0A\u9650 (MB)</label>
+            <input type="number" id="setupMaxTmpFileMB" value="1024" min="1" max="102400" />
+            <div class="chips">
+              <button type="button" class="chip" data-set-input="setupMaxTmpFileMB" data-val="128">128 MB</button>
+              <button type="button" class="chip" data-set-input="setupMaxTmpFileMB" data-val="512">512 MB</button>
+              <button type="button" class="chip" data-set-input="setupMaxTmpFileMB" data-val="1024">1 GB</button>
+              <button type="button" class="chip" data-set-input="setupMaxTmpFileMB" data-val="2048">2 GB</button>
+              <button type="button" class="chip" data-set-input="setupMaxTmpFileMB" data-val="4096">4 GB</button>
+            </div>
+          </div>
+          <div>
+            <label data-i18n="maxTmpTotalLabel">\u4E34\u65F6\u7F13\u5B58\u603B\u5BB9\u91CF\u4E0A\u9650 (MB)</label>
+            <input type="number" id="setupMaxTmpTotalMB" value="8192" min="16" max="1024000" />
+            <div class="chips">
+              <button type="button" class="chip" data-set-input="setupMaxTmpTotalMB" data-val="1024">1 GB</button>
+              <button type="button" class="chip" data-set-input="setupMaxTmpTotalMB" data-val="8192">8 GB (R2 \u514D\u8D39\u5C42\u63A8\u8350)</button>
+              <button type="button" class="chip" data-set-input="setupMaxTmpTotalMB" data-val="20480">20 GB</button>
+              <button type="button" class="chip" data-set-input="setupMaxTmpTotalMB" data-val="51200">50 GB</button>
+            </div>
+          </div>
+          <div>
+            <label data-i18n="tmpTTLHoursLabel">\u4E34\u65F6\u6587\u4EF6\u4FDD\u7559\u671F\u9650 (\u5C0F\u65F6)</label>
+            <input type="number" id="setupTmpTTLHours" value="12" min="1" max="720" />
+            <div class="chips">
+              <button type="button" class="chip" data-set-input="setupTmpTTLHours" data-val="1">1h</button>
+              <button type="button" class="chip" data-set-input="setupTmpTTLHours" data-val="4">4h</button>
+              <button type="button" class="chip" data-set-input="setupTmpTTLHours" data-val="12">12h</button>
+              <button type="button" class="chip" data-set-input="setupTmpTTLHours" data-val="24">24h (1\u5929)</button>
+              <button type="button" class="chip" data-set-input="setupTmpTTLHours" data-val="72">72h (3\u5929)</button>
+              <button type="button" class="chip" data-set-input="setupTmpTTLHours" data-val="168">7\u5929</button>
+            </div>
+          </div>
+          <div>
+            <label data-i18n="tmpAckGraceLabel">\u5BF9\u7AEF\u63A5\u6536 (ACK) \u540E\u56DE\u6536\u7B56\u7565</label>
+            <select id="setupTmpAckGrace">
+              <option value="30">\u7B7E\u6536\u540E\u4FDD\u7559 30 \u5206\u949F\uFF08\u9ED8\u8BA4 \xB7 \u517C\u987E\u591A\u7AEF\u7C98\u8D34\uFF09</option>
+              <option value="0">\u7B7E\u6536\u5373\u711A\uFF08\u4E0B\u8F7D\u5B8C\u6210\u540E\u7ACB\u5373\u7269\u7406\u5220\u9664\uFF09</option>
+              <option value="120">\u7B7E\u6536\u540E\u4FDD\u7559 2 \u5C0F\u65F6</option>
+              <option value="-1">\u4E0D\u63D0\u524D\u56DE\u6536\uFF08\u4E25\u683C\u6309\u4FDD\u7559\u671F\u9650\u5230\u671F\u6E05\u7406\uFF09</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
       <details style="margin-top:14px;">
-        <summary style="cursor:pointer; font-size:12.5px; color:var(--muted); font-weight:600;" data-i18n="advancedOptions">\u9AD8\u7EA7\u53C2\u6570\uFF08\u4E2D\u7EE7\u540D\u79F0 / \u914D\u989D / \u81EA\u5B9A\u4E49 Auth API\uFF09</summary>
+        <summary style="cursor:pointer; font-size:12.5px; color:var(--muted); font-weight:600;" data-i18n="advancedOptions">\u9AD8\u7EA7\u53C2\u6570\uFF08\u4E2D\u7EE7\u540D\u79F0 / \u666E\u901A\u526A\u8D34\u677F\u914D\u989D / \u81EA\u5B9A\u4E49 Auth API\uFF09</summary>
         <div class="grid-2" style="margin-top:8px;">
           <div>
             <label data-i18n="siteNameLabel">\u4E2D\u7EE7\u540D\u79F0</label>
@@ -464,15 +679,15 @@ var SETUP_UI_HTML = `<!DOCTYPE html>
             <input type="number" id="setupMaxEnvelopes" value="500" min="50" max="5000" />
           </div>
           <div>
-            <label data-i18n="maxBlobLabel">\u5355\u6587\u4EF6\u6700\u5927\u4F53\u79EF (MB)</label>
+            <label data-i18n="maxBlobLabel">\u666E\u901A\u5185\u8054\u56FE\u7247/\u5C0F\u9644\u4EF6\u4E0A\u9650 (MB)</label>
             <input type="number" id="setupMaxBlobMB" value="25" min="1" max="512" />
           </div>
           <div>
-            <label data-i18n="blobTTLLabel">\u52A0\u5BC6\u6587\u4EF6\u4FDD\u7559\u5929\u6570</label>
+            <label data-i18n="blobTTLLabel">\u666E\u901A\u526A\u8D34\u677F\u56FE\u7247\u4FDD\u7559\u5929\u6570</label>
             <input type="number" id="setupBlobTTLDays" value="7" min="1" max="365" />
           </div>
           <div>
-            <label data-i18n="adminTokenOptLabel">\u66F4\u65B0\u53D1\u5E03 Admin Token\uFF08\u53EF\u9009\uFF09</label>
+            <label data-i18n="adminTokenOptLabel">\u5907\u7528\u7BA1\u7406\u4EE4\u724C Admin Token\uFF08\u53EF\u9009\uFF09</label>
             <input type="password" id="setupAdminToken" class="mono" placeholder="\u7559\u7A7A\u5219\u6CBF\u7528\u673A\u4E3B\u8EAB\u4EFD\u6216\u9759\u6001\u4EE4\u724C" />
           </div>
         </div>
@@ -559,6 +774,126 @@ var SETUP_UI_HTML = `<!DOCTYPE html>
       <div id="adminAuthMsg" class="notice hidden"></div>
     </div>
 
+    <!-- TMP LARGE FILE STORAGE & EXPIRATION POLICY CARD -->
+    <div id="tmpStorageCard" class="card hidden">
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+        <div>
+          <h2 data-i18n="tmpCardTitle">\u4E34\u65F6\u5927\u6587\u4EF6\u4E2D\u8F6C (Tmp) \u5B58\u50A8\u4E0E\u671F\u9650\u8BBE\u7F6E</h2>
+          <p class="sub" style="margin-bottom:0;" id="tmpCardSubtitle">8MiB \u5206\u5757 E2EE \u6D41\u5F0F\u4E2D\u8F6C \xB7 \u652F\u6301\u968F\u65F6\u5728\u7EBF\u4FEE\u6539\u5355\u6587\u4EF6\u4F53\u79EF\u4E0A\u9650\u4E0E\u81EA\u52A8\u8FC7\u671F\u65F6\u95F4</p>
+        </div>
+        <span class="pill accent" id="storageBackendPill">Storage</span>
+      </div>
+
+      <div class="kv-grid" style="margin-top:12px;">
+        <div class="kv">
+          <div class="k" data-i18n="kvTmpUsed">\u5F53\u524D\u4E34\u65F6\u4E2D\u8F6C\u5360\u7528</div>
+          <div class="v" id="tmpUsageText">0 MB / 8192 MB</div>
+          <div class="bar-track"><div class="bar-fill" id="tmpUsageBar" style="width:0%;"></div></div>
+        </div>
+        <div class="kv">
+          <div class="k" id="diskOrEngineLabel">\u5B58\u50A8\u540E\u7AEF / \u78C1\u76D8\u7A7A\u95F4</div>
+          <div class="v" id="diskOrEngineValue">-</div>
+        </div>
+      </div>
+
+      <div id="cfR2GuideNotice" class="notice info hidden" style="margin-top:8px;">
+        \u5F53\u524D Cloudflare Worker \u672A\u7ED1\u5B9A R2 \u6876\uFF0C\u5DF2\u81EA\u52A8\u8FD0\u884C\u4E8E\u514D\u8D39 DO SQLite \u6D41\u5F0F\u5206\u5757\u515C\u5E95\u6A21\u5F0F\uFF08\u5EFA\u8BAE\u5355\u6587\u4EF6 \u2264 128 MB\uFF09\u3002\u5728 Cloudflare \u540E\u53F0\u514D\u8D39\u5F00\u901A R2 \u540E\u91CD\u65B0\u6267\u884C\u4E00\u952E\u90E8\u7F72\u811A\u672C\uFF0C\u5373\u53EF\u81EA\u52A8\u521B\u5EFA\u5E76\u7ED1\u5B9A <code>syncnow-tmp-blobs</code> \u89E3\u9501 1 GB+ \u96F6\u6D41\u91CF\u8D39\u5927\u6587\u4EF6\u4E2D\u8F6C\u3002
+      </div>
+
+      <details id="dockerVpsProxyDetails" class="hidden" style="margin-top:10px;">
+        <summary style="cursor:pointer; font-size:12px; color:var(--muted); font-weight:600;">Docker / Linux VPS \u90E8\u7F72\u4E0E\u53CD\u5411\u4EE3\u7406 (Nginx / Caddy) \u6CE8\u610F\u4E8B\u9879</summary>
+        <div class="notice" style="margin-top:8px; font-size:12px; color:var(--muted);">
+          \u2022 \u6570\u636E\u76EE\u5F55\uFF08Docker <code>/data</code> \u5377\u6216 VPS <code>/var/lib/syncnow-relay</code>\uFF09\u4F1A\u81EA\u52A8\u68C0\u6D4B\u5BBF\u4E3B\u673A\u78C1\u76D8\u5269\u4F59\u7A7A\u95F4\uFF0C\u9632\u6B62\u5199\u6EE1\u7CFB\u7EDF\u76D8\u3002<br/>
+          \u2022 \u82E5\u524D\u7F6E Nginx \u53CD\u4EE3\uFF0C\u8BF7\u786E\u4FDD\u914D\u7F6E <code>client_max_body_size 64m;</code>\u3001<code>proxy_buffering off;</code>\u3001<code>proxy_request_buffering off;</code> \u5E76\u5F00\u542F WebSocket <code>Upgrade</code> \u5934\uFF08\u8986\u76D6 <code>/ws</code>\u3001<code>/v1/signal/ws</code>\u3001<code>/v1/tunnel/ws</code>\uFF09\u3002Caddy \u4F7F\u7528\u4ED3\u5E93\u81EA\u5E26\u6A21\u677F\u5373\u53EF\u5F00\u7BB1\u6D41\u5F0F\u8F6C\u53D1\u3002
+        </div>
+      </details>
+
+      <div class="grid-2" style="margin-top:12px;">
+        <div>
+          <label data-i18n="maxTmpFileLabel">\u5355\u6587\u4EF6\u5927\u5C0F\u4E0A\u9650 (MB)</label>
+          <input type="number" id="dashMaxTmpFileMB" value="1024" min="1" max="102400" />
+          <div class="chips">
+            <button type="button" class="chip" data-set-input="dashMaxTmpFileMB" data-val="128">128 MB</button>
+            <button type="button" class="chip" data-set-input="dashMaxTmpFileMB" data-val="512">512 MB</button>
+            <button type="button" class="chip" data-set-input="dashMaxTmpFileMB" data-val="1024">1 GB</button>
+            <button type="button" class="chip" data-set-input="dashMaxTmpFileMB" data-val="2048">2 GB</button>
+            <button type="button" class="chip" data-set-input="dashMaxTmpFileMB" data-val="4096">4 GB</button>
+          </div>
+        </div>
+        <div>
+          <label data-i18n="maxTmpTotalLabel">\u4E34\u65F6\u7F13\u5B58\u603B\u5BB9\u91CF\u4E0A\u9650 (MB)</label>
+          <input type="number" id="dashMaxTmpTotalMB" value="8192" min="16" max="1024000" />
+          <div class="chips">
+            <button type="button" class="chip" data-set-input="dashMaxTmpTotalMB" data-val="1024">1 GB</button>
+            <button type="button" class="chip" data-set-input="dashMaxTmpTotalMB" data-val="8192">8 GB (R2 \u514D\u8D39\u7EA2\u7EBF)</button>
+            <button type="button" class="chip" data-set-input="dashMaxTmpTotalMB" data-val="20480">20 GB</button>
+            <button type="button" class="chip" data-set-input="dashMaxTmpTotalMB" data-val="51200">50 GB</button>
+          </div>
+        </div>
+        <div>
+          <label data-i18n="tmpTTLHoursLabel">\u4E34\u65F6\u6587\u4EF6\u4FDD\u7559\u671F\u9650 (\u5C0F\u65F6)</label>
+          <input type="number" id="dashTmpTTLHours" value="12" min="1" max="720" />
+          <div class="chips">
+            <button type="button" class="chip" data-set-input="dashTmpTTLHours" data-val="1">1h</button>
+            <button type="button" class="chip" data-set-input="dashTmpTTLHours" data-val="4">4h</button>
+            <button type="button" class="chip" data-set-input="dashTmpTTLHours" data-val="12">12h</button>
+            <button type="button" class="chip" data-set-input="dashTmpTTLHours" data-val="24">24h</button>
+            <button type="button" class="chip" data-set-input="dashTmpTTLHours" data-val="72">72h</button>
+            <button type="button" class="chip" data-set-input="dashTmpTTLHours" data-val="168">7\u5929</button>
+          </div>
+        </div>
+        <div>
+          <label data-i18n="tmpAckGraceLabel">\u5BF9\u7AEF\u63A5\u6536 (ACK) \u540E\u56DE\u6536\u7B56\u7565</label>
+          <select id="dashTmpAckGrace">
+            <option value="30">\u7B7E\u6536\u540E\u4FDD\u7559 30 \u5206\u949F\uFF08\u9ED8\u8BA4\uFF09</option>
+            <option value="0">\u7B7E\u6536\u5373\u711A\uFF080 \u5206\u949F\u7ACB\u5373\u6E05\u7406\uFF09</option>
+            <option value="120">\u7B7E\u6536\u540E\u4FDD\u7559 2 \u5C0F\u65F6</option>
+            <option value="-1">\u4E0D\u63D0\u524D\u56DE\u6536\uFF08\u4EC5\u6309\u4FDD\u7559\u671F\u9650\u5230\u671F\uFF09</option>
+          </select>
+        </div>
+      </div>
+
+      <div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap;">
+        <button type="button" class="btn primary sm" id="saveTmpPolicyBtn" data-i18n="saveTmpPolicyBtn">\u4FDD\u5B58\u5927\u5C0F\u4E0E\u671F\u9650\u8BBE\u7F6E</button>
+        <button type="button" class="btn danger sm" id="purgeTmpBtn" data-i18n="purgeTmpBtn">\u4E00\u952E\u6E05\u7A7A\u4E34\u65F6\u6587\u4EF6\u7F13\u5B58</button>
+      </div>
+      <div id="tmpPolicyNotice" class="notice hidden"></div>
+    </div>
+
+    <!-- SCOPED DEVICE TOKENS FOR MOBILE / MAS ONBOARDING -->
+    <div id="deviceTokensCard" class="card hidden">
+      <h2 data-i18n="devTokTitle">\u79FB\u52A8\u7AEF / \u514D\u8D26\u53F7\u91CD\u5B9A\u5411\u8BBE\u5907\u63A5\u5165\u4EE4\u724C (snr_dev_...)</h2>
+      <p class="sub" data-i18n="devTokDesc">\u7B7E\u53D1\u4EC5\u9650\u526A\u8D34\u677F\u3001Tmp \u5927\u6587\u4EF6\u4E0E\u540C\u8D26\u53F7\u4FE1\u4EE4\u7684\u53D7\u9650\u4EE4\u724C\uFF08\u4E0D\u53EF\u4FEE\u6539\u7BA1\u7406\u540E\u53F0\uFF09\uFF0C\u4F9B iOS / Android / \u9E3F\u8499 / Mac App Store \u7248\u4E00\u952E\u5BFC\u5165\u3002</p>
+
+      <div class="grid-2">
+        <div>
+          <label data-i18n="devTokLabelInput">\u8BBE\u5907\u5907\u6CE8\u540D\u79F0</label>
+          <input type="text" id="newDevTokLabel" placeholder="\u4F8B\u5982\uFF1AiPhone 17 Pro / MatePad" />
+        </div>
+        <div>
+          <label data-i18n="devTokGroupKeyOpt">\u53EF\u9009\uFF1A\u62FC\u63A5\u672C\u5730 SNK- \u7EC4\u5BC6\u94A5\uFF08\u4EC5\u6D4F\u89C8\u5668\u672C\u5730\u62FC\u5165\u94FE\u63A5\uFF0C\u4E0D\u4E0A\u4F20\u670D\u52A1\u5668\uFF09</label>
+          <input type="text" id="localGroupKeyForURI" class="mono" placeholder="SNK-...\uFF08\u7559\u7A7A\u5219\u4EC5\u751F\u6210\u4E2D\u7EE7\u4EE4\u724C\uFF09" />
+        </div>
+      </div>
+      <div style="margin-top:10px;">
+        <button type="button" class="btn sm primary" id="issueDevTokBtn" data-i18n="issueDevTokBtn">\u7B7E\u53D1\u8BBE\u5907\u4EE4\u724C\u5E76\u751F\u6210\u914D\u5BF9 URI</button>
+      </div>
+
+      <div id="issuedTokenBox" class="hidden" style="margin-top:12px;">
+        <label>\u65B0\u7B7E\u53D1\u7684\u53D7\u9650\u8BBE\u5907\u4EE4\u724C / \u4E00\u952E\u5BFC\u5165 URI\uFF08\u4EC5\u663E\u793A\u4E00\u6B21\uFF0C\u8BF7\u590D\u5236\u5BFC\u5165\uFF09\uFF1A</label>
+        <div class="row" style="margin-bottom:8px;">
+          <div class="code-box" style="flex:1;" id="issuedRawToken">-</div>
+          <button type="button" class="btn sm" id="copyIssuedTokBtn">\u590D\u5236\u4EE4\u724C</button>
+        </div>
+        <div class="row">
+          <div class="code-box" style="flex:1;" id="issuedPairURI">-</div>
+          <button type="button" class="btn sm" id="copyIssuedURIBtn">\u590D\u5236 syncnow:// \u5BFC\u5165\u94FE\u63A5</button>
+        </div>
+      </div>
+
+      <div id="deviceTokensList" style="margin-top:12px; font-size:12.5px; color:var(--muted);">-</div>
+    </div>
+
     <!-- ADMIN ONLINE PEERS & DANGER ZONE -->
     <div id="adminPeersCard" class="card hidden">
       <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
@@ -598,12 +933,26 @@ var SETUP_UI_HTML = `<!DOCTYPE html>
         allowUsersLabel: '\u5141\u8BB8\u4F7F\u7528\u7684 xtags \u7528\u6237 ID \u767D\u540D\u5355\uFF08\u9017\u53F7\u5206\u9694\uFF0C\u9ED8\u8BA4\u4EC5\u4F60\u672C\u4EBA\uFF09',
         staticTokenLabel: '2. \u8BBE\u7F6E\u9759\u6001\u8BBF\u95EE\u4EE4\u724C\uFF08\u540C\u65F6\u7528\u4E8E\u7BA1\u7406\u5458\u767B\u5F55\uFF09',
         genRandomBtn: '\u968F\u673A\u751F\u6210',
-        advancedOptions: '\u9AD8\u7EA7\u53C2\u6570\uFF08\u4E2D\u7EE7\u540D\u79F0 / \u914D\u989D / \u81EA\u5B9A\u4E49 Auth API\uFF09',
+        advancedOptions: '\u9AD8\u7EA7\u53C2\u6570\uFF08\u4E2D\u7EE7\u540D\u79F0 / \u666E\u901A\u526A\u8D34\u677F\u914D\u989D / \u81EA\u5B9A\u4E49 Auth API\uFF09',
         siteNameLabel: '\u4E2D\u7EE7\u540D\u79F0',
         maxEnvLabel: '\u6BCF\u7EC4\u4FDD\u7559\u526A\u8D34\u677F\u6761\u6570',
-        maxBlobLabel: '\u5355\u6587\u4EF6\u6700\u5927\u4F53\u79EF (MB)',
-        blobTTLLabel: '\u52A0\u5BC6\u6587\u4EF6\u4FDD\u7559\u5929\u6570',
-        adminTokenOptLabel: '\u66F4\u65B0\u53D1\u5E03 Admin Token\uFF08\u53EF\u9009\uFF09',
+        maxBlobLabel: '\u666E\u901A\u5185\u8054\u56FE\u7247/\u5C0F\u9644\u4EF6\u4E0A\u9650 (MB)',
+        blobTTLLabel: '\u666E\u901A\u526A\u8D34\u677F\u56FE\u7247\u4FDD\u7559\u5929\u6570',
+        adminTokenOptLabel: '\u5907\u7528\u7BA1\u7406\u4EE4\u724C Admin Token\uFF08\u53EF\u9009\uFF09',
+        tmpSectionTitle: '3. \u4E34\u65F6\u5927\u6587\u4EF6\u4E2D\u8F6C (Tmp) \u5927\u5C0F\u4E0E\u4FDD\u7559\u671F\u9650',
+        maxTmpFileLabel: '\u5355\u6587\u4EF6\u5927\u5C0F\u4E0A\u9650 (MB)',
+        maxTmpTotalLabel: '\u4E34\u65F6\u7F13\u5B58\u603B\u5BB9\u91CF\u4E0A\u9650 (MB)',
+        tmpTTLHoursLabel: '\u4E34\u65F6\u6587\u4EF6\u4FDD\u7559\u671F\u9650 (\u5C0F\u65F6)',
+        tmpAckGraceLabel: '\u5BF9\u7AEF\u63A5\u6536 (ACK) \u540E\u56DE\u6536\u7B56\u7565',
+        tmpCardTitle: '\u4E34\u65F6\u5927\u6587\u4EF6\u4E2D\u8F6C (Tmp) \u5B58\u50A8\u4E0E\u671F\u9650\u8BBE\u7F6E',
+        kvTmpUsed: '\u5F53\u524D\u4E34\u65F6\u4E2D\u8F6C\u5360\u7528',
+        saveTmpPolicyBtn: '\u4FDD\u5B58\u5927\u5C0F\u4E0E\u671F\u9650\u8BBE\u7F6E',
+        purgeTmpBtn: '\u4E00\u952E\u6E05\u7A7A\u4E34\u65F6\u6587\u4EF6\u7F13\u5B58',
+        devTokTitle: '\u79FB\u52A8\u7AEF / \u514D\u8D26\u53F7\u91CD\u5B9A\u5411\u8BBE\u5907\u63A5\u5165\u4EE4\u724C (snr_dev_...)',
+        devTokDesc: '\u7B7E\u53D1\u4EC5\u9650\u526A\u8D34\u677F\u3001Tmp \u5927\u6587\u4EF6\u4E0E\u540C\u8D26\u53F7\u4FE1\u4EE4\u7684\u53D7\u9650\u4EE4\u724C\uFF08\u4E0D\u53EF\u4FEE\u6539\u7BA1\u7406\u540E\u53F0\uFF09\uFF0C\u4F9B iOS / Android / \u9E3F\u8499 / Mac App Store \u7248\u4E00\u952E\u5BFC\u5165\u3002',
+        devTokLabelInput: '\u8BBE\u5907\u5907\u6CE8\u540D\u79F0',
+        devTokGroupKeyOpt: '\u53EF\u9009\uFF1A\u62FC\u63A5\u672C\u5730 SNK- \u7EC4\u5BC6\u94A5\uFF08\u4EC5\u6D4F\u89C8\u5668\u672C\u5730\u62FC\u5165\u94FE\u63A5\uFF0C\u4E0D\u4E0A\u4F20\u670D\u52A1\u5668\uFF09',
+        issueDevTokBtn: '\u7B7E\u53D1\u8BBE\u5907\u4EE4\u724C\u5E76\u751F\u6210\u914D\u5BF9 URI',
         completeSetupBtn: '\u5B8C\u6210\u521D\u59CB\u5316\u5E76\u4FDD\u5B58\u914D\u7F6E',
         saveEditBtn: '\u4FDD\u5B58\u914D\u7F6E\u66F4\u6539',
         cancelBtn: '\u53D6\u6D88',
@@ -650,12 +999,26 @@ var SETUP_UI_HTML = `<!DOCTYPE html>
         allowUsersLabel: 'Allowed xtags User IDs (comma-separated, defaults to owner)',
         staticTokenLabel: '2. Set Static Access Token (also unlocks Admin Settings)',
         genRandomBtn: 'Generate',
-        advancedOptions: 'Advanced Settings (Site Name / Quotas / Custom Auth API)',
+        advancedOptions: 'Advanced Settings (Site Name / Clipboard Quotas / Auth API)',
         siteNameLabel: 'Relay Name',
         maxEnvLabel: 'Max Retained Envelopes / Group',
-        maxBlobLabel: 'Max Encrypted Blob Size (MB)',
-        blobTTLLabel: 'Encrypted Blob TTL (Days)',
-        adminTokenOptLabel: 'Release Admin Token (Optional)',
+        maxBlobLabel: 'Max Inline Image/Small Blob (MB)',
+        blobTTLLabel: 'Inline Blob TTL (Days)',
+        adminTokenOptLabel: 'Backup Admin Token (Optional)',
+        tmpSectionTitle: '3. Temporary Large-File Relay (Tmp) Size & Expiration',
+        maxTmpFileLabel: 'Max Single Tmp File Size (MB)',
+        maxTmpTotalLabel: 'Max Total Tmp Cache Cap (MB)',
+        tmpTTLHoursLabel: 'Tmp File Retention (Hours)',
+        tmpAckGraceLabel: 'Post-ACK Cleanup Policy',
+        tmpCardTitle: 'Tmp Large-File Relay Storage & Expiration',
+        kvTmpUsed: 'Active Tmp Cache Usage',
+        saveTmpPolicyBtn: 'Save Size & TTL Policy',
+        purgeTmpBtn: 'Purge All Tmp Files',
+        devTokTitle: 'Scoped Device Access Tokens (snr_dev_...)',
+        devTokDesc: 'Issue revocable data-plane tokens for iOS, Android, HarmonyOS & Mac App Store onboarding without web login redirects.',
+        devTokLabelInput: 'Device Label',
+        devTokGroupKeyOpt: 'Optional: Local SNK- Group Key (combined client-side only)',
+        issueDevTokBtn: 'Issue Device Token & Pairing URI',
         completeSetupBtn: 'Finish Setup & Save',
         saveEditBtn: 'Save Configuration',
         cancelBtn: 'Cancel',
@@ -753,6 +1116,110 @@ var SETUP_UI_HTML = `<!DOCTYPE html>
       renderStatus();
     }
 
+    function formatBytesHuman(bytes) {
+      const b = Number(bytes || 0);
+      if (b <= 0) return '0 MB';
+      const gb = b / (1024 * 1024 * 1024);
+      if (gb >= 1) return gb.toFixed(2) + ' GB';
+      const mb = b / (1024 * 1024);
+      if (mb >= 0.1) return mb.toFixed(1) + ' MB';
+      return Math.max(1, Math.round(b / 1024)) + ' KB';
+    }
+
+    function runtimeLabelText(s) {
+      if (s.runtime === 'cloudflare-workers') return 'Cloudflare Workers';
+      if (s.runtime === 'docker') return 'Docker Container';
+      if (s.runtime === 'linux-vps') return 'Linux VPS';
+      return 'Go Relay';
+    }
+
+    function renderTmpAndTokens(s) {
+      const showAdminCards = Boolean(s.initialized && s.isAdmin);
+      $('tmpStorageCard').classList.toggle('hidden', !showAdminCards);
+      $('deviceTokensCard').classList.toggle('hidden', !showAdminCards);
+      if (!showAdminCards) return;
+
+      const ts = s.tmpStats || {
+        storageBackend: s.storageBackend || (s.r2Enabled ? 'r2' : 'disk'),
+        activeFiles: 0,
+        uploadingFiles: 0,
+        usedBytes: 0,
+        maxTmpFileMB: s.maxTmpFileMB || 1024,
+        maxTmpTotalMB: s.maxTmpTotalMB || 8192,
+        tmpTTLHours: s.tmpTTLHours || 12,
+        tmpAckGraceMinutes: s.tmpAckGraceMinutes ?? 30,
+      };
+      const backend = ts.storageBackend;
+      if (backend === 'r2') {
+        $('storageBackendPill').textContent = 'Cloudflare R2 \xB7 Zero Egress';
+      } else if (backend === 'do_sqlite') {
+        $('storageBackendPill').textContent = 'CF DO SQLite (Free Fallback)';
+      } else if (s.runtime === 'docker') {
+        $('storageBackendPill').textContent = 'Docker Volume (' + (s.dataDir || '/data') + ')';
+      } else {
+        $('storageBackendPill').textContent = 'VPS Disk (' + (s.dataDir || 'local') + ')';
+      }
+
+      const maxBytes = Math.max(1, Number(ts.maxTmpTotalMB || 8192) * 1024 * 1024);
+      const pct = Math.min(100, Math.round((Number(ts.usedBytes || 0) / maxBytes) * 100));
+      $('tmpUsageText').textContent =
+        \`\${formatBytesHuman(ts.usedBytes)} / \${ts.maxTmpTotalMB} MB \xB7 \${ts.activeFiles || 0} \u4E2A\u5C31\u7EEA\u6587\u4EF6\` +
+        (ts.uploadingFiles ? \` (\${ts.uploadingFiles} \u4E0A\u4F20\u4E2D)\` : '');
+      $('tmpUsageBar').style.width = \`\${pct}%\`;
+
+      if (ts.diskUsage && ts.diskUsage.totalBytes > 0) {
+        $('diskOrEngineLabel').textContent = lang === 'zh' ? '\u5BBF\u4E3B\u673A / \u6570\u636E\u5377\u78C1\u76D8\u5269\u4F59' : 'Filesystem Free Space';
+        $('diskOrEngineValue').textContent =
+          \`\${formatBytesHuman(ts.diskUsage.freeBytes)} \u53EF\u7528 / \u5171 \${formatBytesHuman(ts.diskUsage.totalBytes)}\`;
+      } else {
+        $('diskOrEngineLabel').textContent = lang === 'zh' ? '\u5F53\u524D\u7B56\u7565\u6458\u8981' : 'Active Tmp Policy';
+        $('diskOrEngineValue').textContent =
+          \`\u5355\u6587\u4EF6 \u2264 \${ts.maxTmpFileMB} MB \xB7 \u4FDD\u7559 \${ts.tmpTTLHours}h\`;
+      }
+
+      $('cfR2GuideNotice').classList.toggle('hidden', !(s.runtime === 'cloudflare-workers' && !s.r2Enabled));
+      $('dockerVpsProxyDetails').classList.toggle('hidden', s.runtime === 'cloudflare-workers');
+
+      $('dashMaxTmpFileMB').value = ts.maxTmpFileMB || s.maxTmpFileMB || 1024;
+      $('dashMaxTmpTotalMB').value = ts.maxTmpTotalMB || s.maxTmpTotalMB || 8192;
+      $('dashTmpTTLHours').value = ts.tmpTTLHours || s.tmpTTLHours || 12;
+      $('dashTmpAckGrace').value = String(ts.tmpAckGraceMinutes ?? s.tmpAckGraceMinutes ?? 30);
+
+      renderDeviceTokensList(s.deviceTokens || []);
+    }
+
+    function renderDeviceTokensList(tokens) {
+      const box = $('deviceTokensList');
+      if (!tokens || tokens.length === 0) {
+        box.textContent = lang === 'zh'
+          ? '\u5C1A\u672A\u7B7E\u53D1\u53D7\u9650\u8BBE\u5907\u4EE4\u724C\uFF08\u684C\u9762\u7AEF\u751F\u6210\u914D\u5BF9\u4E8C\u7EF4\u7801\u6216\u70B9\u51FB\u4E0A\u65B9\u6309\u94AE\u65F6\u4F1A\u81EA\u52A8\u521B\u5EFA\uFF09'
+          : 'No scoped device tokens issued yet.';
+        return;
+      }
+      box.innerHTML = tokens.map((t) => {
+        const created = t.createdAtMs ? new Date(t.createdAtMs).toLocaleDateString() : '';
+        return \`<div class="kv" style="margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; gap:8px;">
+          <div>
+            <div class="v" style="font-size:12.5px;">\${escapeHtml(t.label)} <span class="mono" style="color:var(--muted); font-weight:400;">(\${escapeHtml(t.tokenPreview)})</span></div>
+            <div class="k" style="text-transform:none;">Room: \${escapeHtml(t.roomID)} \xB7 \${escapeHtml(created)}</div>
+          </div>
+          <button type="button" class="btn sm danger" data-revoke-tok="\${escapeHtml(t.id)}">\${lang === 'zh' ? '\u540A\u9500' : 'Revoke'}</button>
+        </div>\`;
+      }).join('');
+      box.querySelectorAll('[data-revoke-tok]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const id = btn.getAttribute('data-revoke-tok');
+          if (!id) return;
+          btn.disabled = true;
+          await fetch('/v1/auth/device-tokens/' + encodeURIComponent(id), {
+            method: 'DELETE',
+            headers: { Authorization: 'Bearer ' + adminBearer },
+          });
+          await loadStatus();
+        });
+      });
+    }
+
     function renderStatus(opts = {}) {
       const { preserveForm = false } = opts;
       const s = currentStatus;
@@ -767,6 +1234,8 @@ var SETUP_UI_HTML = `<!DOCTYPE html>
         $('runtimePill').textContent = '401 \xB7 Auth Required';
         $('setupWizardCard').classList.add('hidden');
         $('overviewCard').classList.add('hidden');
+        $('tmpStorageCard').classList.add('hidden');
+        $('deviceTokensCard').classList.add('hidden');
         $('adminPeersCard').classList.add('hidden');
         $('adminAuthCard').classList.remove('hidden');
         $('adminLoginDesc').textContent = dict.adminLoginDesc;
@@ -776,7 +1245,7 @@ var SETUP_UI_HTML = `<!DOCTYPE html>
       }
 
       $('siteTitle').textContent = s.siteName || 'SyncNow Relay';
-      const baseRuntime = \`\${s.runtime === 'cloudflare-workers' ? 'Cloudflare Workers' : 'Go Relay'} \xB7 v\${s.version || '0.3.2'}\`;
+      const baseRuntime = \`\${runtimeLabelText(s)} \xB7 v\${s.version || '0.4.0'}\`;
       $('runtimePill').textContent = relayUpdateInfo?.hasUpdate
         ? \`\${baseRuntime} \xB7 \${lang === 'zh' ? '\u6709\u65B0\u7248' : 'Update'} v\${relayUpdateInfo.latestVersion}\`
         : baseRuntime;
@@ -799,7 +1268,11 @@ var SETUP_UI_HTML = `<!DOCTYPE html>
       $('ownerDisplay').textContent = s.ownerDisplayName
         ? \`\${s.ownerDisplayName} (\${s.ownerUserID || ''})\`
         : (s.authMode === 'static_token' ? 'Static Token' : (s.ownerLocked ? \`\${s.allowUsersCount} allowed\` : 'Any valid xtags user'));
-      $('quotaDisplay').textContent = \`\${s.maxEnvelopes} items \xB7 \${s.maxBlobMB}MB/file \xB7 \${s.blobTTLDays}d TTL\${s.r2Enabled ? ' \xB7 R2' : ''}\`;
+      const tmpMB = s.maxTmpFileMB || 1024;
+      const tmpHours = s.tmpTTLHours || 12;
+      $('quotaDisplay').textContent = \`Tmp \u2264 \${tmpMB}MB/\u6587\u4EF6 (\${tmpHours}h) \xB7 \u603B\u4E0A\u9650 \${s.maxTmpTotalMB || 8192}MB\${s.r2Enabled ? ' \xB7 R2' : ''}\`;
+
+      renderTmpAndTokens(s);
 
       if (!s.initialized) {
         isEditingExisting = false;
@@ -841,6 +1314,10 @@ var SETUP_UI_HTML = `<!DOCTYPE html>
       $('setupMaxEnvelopes').value = s.maxEnvelopes || 500;
       $('setupMaxBlobMB').value = s.maxBlobMB || 25;
       $('setupBlobTTLDays').value = s.blobTTLDays || 7;
+      $('setupMaxTmpFileMB').value = s.maxTmpFileMB || (s.runtime === 'cloudflare-workers' && !s.r2Enabled ? 128 : 1024);
+      $('setupMaxTmpTotalMB').value = s.maxTmpTotalMB || (s.runtime === 'cloudflare-workers' && !s.r2Enabled ? 1024 : 8192);
+      $('setupTmpTTLHours').value = s.tmpTTLHours || (s.runtime === 'cloudflare-workers' && !s.r2Enabled ? 4 : 12);
+      $('setupTmpAckGrace').value = String(s.tmpAckGraceMinutes ?? 30);
       $('setupAllowUsers').value = Array.isArray(s.allowUsers) ? s.allowUsers.join(', ') : '';
       if (s.ownerUserID && !verifiedXTags) {
         const label = s.ownerDisplayName ? \`\${s.ownerDisplayName} (\${s.ownerUserID})\` : s.ownerUserID;
@@ -1067,6 +1544,10 @@ var SETUP_UI_HTML = `<!DOCTYPE html>
           maxEnvelopes: Number($('setupMaxEnvelopes').value) || 500,
           maxBlobMB: Number($('setupMaxBlobMB').value) || 25,
           blobTTLDays: Number($('setupBlobTTLDays').value) || 7,
+          maxTmpFileMB: Number($('setupMaxTmpFileMB').value) || 1024,
+          maxTmpTotalMB: Number($('setupMaxTmpTotalMB').value) || 8192,
+          tmpTTLHours: Number($('setupTmpTTLHours').value) || 12,
+          tmpAckGraceMinutes: Number($('setupTmpAckGrace').value),
         };
 
         const headers = { 'Content-Type': 'application/json' };
@@ -1303,6 +1784,114 @@ var SETUP_UI_HTML = `<!DOCTYPE html>
     $('checkRelayUpdateBtn').addEventListener('click', () => void checkRelayUpdate(true));
     $('closeRelayUpdateBtn').addEventListener('click', () => $('relayUpdateBox').classList.add('hidden'));
 
+    document.querySelectorAll('[data-set-input]').forEach((chip) => {
+      chip.addEventListener('click', () => {
+        const targetId = chip.getAttribute('data-set-input');
+        const val = chip.getAttribute('data-val');
+        if (targetId && $(targetId) && val !== null) {
+          $(targetId).value = val;
+        }
+      });
+    });
+
+    $('saveTmpPolicyBtn').addEventListener('click', async () => {
+      $('saveTmpPolicyBtn').disabled = true;
+      $('tmpPolicyNotice').classList.add('hidden');
+      try {
+        const body = {
+          maxTmpFileMB: Number($('dashMaxTmpFileMB').value) || 1024,
+          maxTmpTotalMB: Number($('dashMaxTmpTotalMB').value) || 8192,
+          tmpTTLHours: Number($('dashTmpTTLHours').value) || 12,
+          tmpAckGraceMinutes: Number($('dashTmpAckGrace').value),
+        };
+        const res = await fetch('/v1/setup/tmp-policy', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer ' + adminBearer,
+          },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.message || \`HTTP \${res.status}\`);
+        await loadStatus();
+        showNotice($('tmpPolicyNotice'), lang === 'zh' ? '\u2713 \u4E34\u65F6\u5927\u6587\u4EF6\u5927\u5C0F\u4E0A\u9650\u4E0E\u4FDD\u7559\u671F\u9650\u5DF2\u5B9E\u65F6\u751F\u6548\uFF01' : '\u2713 Tmp size & expiration policy updated!', 'ok');
+      } catch (err) {
+        showNotice($('tmpPolicyNotice'), err.message || String(err), 'err');
+      } finally {
+        $('saveTmpPolicyBtn').disabled = false;
+      }
+    });
+
+    $('purgeTmpBtn').addEventListener('click', async () => {
+      if (!confirm(lang === 'zh' ? '\u786E\u5B9A\u7ACB\u5373\u5220\u9664\u6B64\u4E2D\u7EE7\u4E0A\u6240\u6709\u6682\u5B58\u7684\u4E34\u65F6\u5927\u6587\u4EF6\u5E76\u91CA\u653E\u7A7A\u95F4\u5417\uFF1F' : 'Delete all temporary relayed files now?')) return;
+      $('purgeTmpBtn').disabled = true;
+      try {
+        const res = await fetch('/v1/setup/purge-tmp', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + adminBearer },
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.message || \`HTTP \${res.status}\`);
+        await loadStatus();
+        showNotice(
+          $('tmpPolicyNotice'),
+          lang === 'zh'
+            ? \`\u2713 \u5DF2\u6E05\u7A7A \${data.purgedCount || 0} \u4E2A\u4E34\u65F6\u6587\u4EF6\uFF0C\u91CA\u653E \${formatBytesHuman(data.freedBytes || 0)}\`
+            : \`\u2713 Purged \${data.purgedCount || 0} file(s), freed \${formatBytesHuman(data.freedBytes || 0)}\`,
+          'ok'
+        );
+      } catch (err) {
+        showNotice($('tmpPolicyNotice'), err.message || String(err), 'err');
+      } finally {
+        $('purgeTmpBtn').disabled = false;
+      }
+    });
+
+    $('issueDevTokBtn').addEventListener('click', async () => {
+      $('issueDevTokBtn').disabled = true;
+      try {
+        const label = $('newDevTokLabel').value.trim() || 'Mobile Device';
+        const res = await fetch('/v1/auth/device-tokens', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer ' + adminBearer,
+          },
+          body: JSON.stringify({ label }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.token) throw new Error(data.message || \`HTTP \${res.status}\`);
+        $('issuedRawToken').textContent = data.token;
+        const qp = new URLSearchParams();
+        qp.set('v', '1');
+        qp.set('relay', window.location.origin);
+        qp.set('token', data.token);
+        const gk = $('localGroupKeyForURI').value.trim();
+        if (gk) qp.set('key', gk);
+        $('issuedPairURI').textContent = 'syncnow://pair?' + qp.toString();
+        $('issuedTokenBox').classList.remove('hidden');
+        $('newDevTokLabel').value = '';
+        await loadStatus();
+      } catch (err) {
+        showNotice($('overviewNotice'), err.message || String(err), 'err');
+      } finally {
+        $('issueDevTokBtn').disabled = false;
+      }
+    });
+
+    $('copyIssuedTokBtn').addEventListener('click', async () => {
+      await copyTextSafe($('issuedRawToken').textContent);
+      $('copyIssuedTokBtn').textContent = I18N[lang].copied;
+      setTimeout(() => { $('copyIssuedTokBtn').textContent = '\u590D\u5236\u4EE4\u724C'; }, 1600);
+    });
+
+    $('copyIssuedURIBtn').addEventListener('click', async () => {
+      await copyTextSafe($('issuedPairURI').textContent);
+      $('copyIssuedURIBtn').textContent = I18N[lang].copied;
+      setTimeout(() => { $('copyIssuedURIBtn').textContent = '\u590D\u5236 syncnow:// \u5BFC\u5165\u94FE\u63A5'; }, 1600);
+    });
+
     $('refreshPeersBtn').addEventListener('click', () => void loadOnlinePeers());
 
     $('resetSetupBtn').addEventListener('click', async () => {
@@ -1356,6 +1945,12 @@ var SETUP_UI_HTML = `<!DOCTYPE html>
 // cloudflare/src/objects.ts
 import { DurableObject } from "cloudflare:workers";
 var CHUNK_SIZE_BYTES = 1024 * 1024;
+function randomHex(bytesLen) {
+  const arr = new Uint8Array(bytesLen);
+  crypto.getRandomValues(arr);
+  return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+__name(randomHex, "randomHex");
 var RelayGroupDO = class extends DurableObject {
   static {
     __name(this, "RelayGroupDO");
@@ -1364,6 +1959,12 @@ var RelayGroupDO = class extends DurableObject {
   dynMaxEnvelopes = null;
   dynMaxBlobMB = null;
   dynBlobTTLDays = null;
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.ctx.setWebSocketAutoResponse(
+      new WebSocketRequestResponsePair('{"type":"ping"}', '{"type":"pong"}')
+    );
+  }
   ensureSchema() {
     if (this.initialized) return;
     this.ctx.storage.sql.exec(`
@@ -1384,11 +1985,20 @@ var RelayGroupDO = class extends DurableObject {
         created_at_ms INTEGER NOT NULL,
         PRIMARY KEY (blob_id, chunk_idx)
       );
+      CREATE TABLE IF NOT EXISTS tmp_part_slices (
+        transfer_id TEXT NOT NULL,
+        part_idx INTEGER NOT NULL,
+        slice_idx INTEGER NOT NULL,
+        data BLOB NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (transfer_id, part_idx, slice_idx)
+      );
       CREATE TABLE IF NOT EXISTS group_meta (
         key TEXT PRIMARY KEY,
         val TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_blob_chunks_created ON blob_chunks(created_at_ms);
+      CREATE INDEX IF NOT EXISTS idx_tmp_slices_transfer ON tmp_part_slices(transfer_id);
     `);
     this.initialized = true;
   }
@@ -1440,6 +2050,9 @@ var RelayGroupDO = class extends DurableObject {
     this.ensureSchema();
     this.applyQuotaHeaders(request);
     const url = new URL(request.url);
+    if (url.pathname.startsWith("/internal/do-tmp/")) {
+      return this.handleInternalDOTmp(request, url);
+    }
     if (url.pathname === "/ws") {
       return this.handleWebSocket(request, url);
     }
@@ -1454,6 +2067,138 @@ var RelayGroupDO = class extends DurableObject {
     }
     return apiError(404, "not_found", "Not found");
   }
+  async handleInternalDOTmp(request, url) {
+    const rest = url.pathname.slice("/internal/do-tmp/".length);
+    if (rest === "purge-all" && request.method === "POST") {
+      this.ctx.storage.sql.exec("DELETE FROM tmp_part_slices");
+      return jsonResponse({ ok: true });
+    }
+    const segs = rest.split("/");
+    const transferID = segs[0] || "";
+    if (!SAFE_ID_REGEX.test(transferID)) {
+      return apiError(400, "invalid_transfer_id", "invalid transferID");
+    }
+    if (segs.length === 1 && request.method === "DELETE") {
+      this.ctx.storage.sql.exec("DELETE FROM tmp_part_slices WHERE transfer_id = ?", transferID);
+      return jsonResponse({ ok: true });
+    }
+    if (segs.length === 1 && request.method === "GET") {
+      const totalChunks = Number(url.searchParams.get("totalChunks") || "0");
+      const totalCipher = Number(url.searchParams.get("totalCipher") || "0");
+      if (totalChunks <= 0 || totalCipher <= 0) {
+        return apiError(400, "invalid_params", "missing chunk counts");
+      }
+      const sql = this.ctx.storage.sql;
+      let curPart = 0;
+      let curSlice = 0;
+      const stream = new ReadableStream({
+        pull(controller) {
+          while (curPart < totalChunks) {
+            const row = sql.exec(
+              "SELECT data FROM tmp_part_slices WHERE transfer_id = ? AND part_idx = ? AND slice_idx = ?",
+              transferID,
+              curPart,
+              curSlice
+            ).toArray()[0];
+            if (row) {
+              curSlice += 1;
+              controller.enqueue(new Uint8Array(row.data));
+              return;
+            }
+            curPart += 1;
+            curSlice = 0;
+          }
+          controller.close();
+        }
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "Content-Length": String(totalCipher)
+        }
+      });
+    }
+    if (segs.length === 3 && segs[1] === "parts") {
+      const partIdx = Number(segs[2]);
+      if (!Number.isInteger(partIdx) || partIdx < 0) {
+        return apiError(400, "invalid_part", "invalid part index");
+      }
+      if (request.method === "PUT" || request.method === "POST") {
+        const expectedLen = Number(url.searchParams.get("expectedLen") || "0");
+        const data = new Uint8Array(await request.arrayBuffer());
+        if (expectedLen > 0 && data.byteLength !== expectedLen) {
+          return apiError(
+            400,
+            "part_size_mismatch",
+            `expected ${expectedLen} bytes, got ${data.byteLength}`
+          );
+        }
+        const now = Date.now();
+        this.ctx.storage.sql.exec(
+          "DELETE FROM tmp_part_slices WHERE transfer_id = ? AND part_idx = ?",
+          transferID,
+          partIdx
+        );
+        let sliceIdx = 0;
+        for (let off = 0; off < data.byteLength; off += CHUNK_SIZE_BYTES) {
+          const slice = data.subarray(off, Math.min(off + CHUNK_SIZE_BYTES, data.byteLength));
+          this.ctx.storage.sql.exec(
+            "INSERT INTO tmp_part_slices (transfer_id, part_idx, slice_idx, data, created_at_ms) VALUES (?, ?, ?, ?, ?)",
+            transferID,
+            partIdx,
+            sliceIdx,
+            slice,
+            now
+          );
+          sliceIdx += 1;
+        }
+        const etag = `do-${partIdx}-${data.byteLength}`;
+        return jsonResponse({ partIndex: partIdx, partNumber: partIdx + 1, etag });
+      }
+      if (request.method === "GET") {
+        const countRow = this.ctx.storage.sql.exec(
+          "SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(data)), 0) AS total FROM tmp_part_slices WHERE transfer_id = ? AND part_idx = ?",
+          transferID,
+          partIdx
+        ).one();
+        if (!countRow || countRow.cnt === 0) {
+          return apiError(404, "not_found", "part not found");
+        }
+        const sql = this.ctx.storage.sql;
+        let sliceIdx = 0;
+        const totalSlices = Number(countRow.cnt);
+        const stream = new ReadableStream({
+          pull(controller) {
+            if (sliceIdx >= totalSlices) {
+              controller.close();
+              return;
+            }
+            const row = sql.exec(
+              "SELECT data FROM tmp_part_slices WHERE transfer_id = ? AND part_idx = ? AND slice_idx = ?",
+              transferID,
+              partIdx,
+              sliceIdx
+            ).toArray()[0];
+            sliceIdx += 1;
+            if (!row) {
+              controller.close();
+              return;
+            }
+            controller.enqueue(new Uint8Array(row.data));
+          }
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": String(countRow.total)
+          }
+        });
+      }
+    }
+    return apiError(404, "not_found", "Not found");
+  }
   handleWebSocket(request, url) {
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return apiError(426, "upgrade_required", "Expected Upgrade: websocket");
@@ -1462,6 +2207,12 @@ var RelayGroupDO = class extends DurableObject {
     const deviceID = url.searchParams.get("device") || "";
     if (!SAFE_ID_REGEX.test(groupHash) || !SAFE_ID_REGEX.test(deviceID)) {
       return apiError(400, "invalid_params", "invalid group or device");
+    }
+    for (const existing of this.ctx.getWebSockets(deviceID)) {
+      try {
+        existing.close(1e3, "Replaced by newer connection");
+      } catch {
+      }
     }
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -1474,18 +2225,31 @@ var RelayGroupDO = class extends DurableObject {
     const meta = ws.deserializeAttachment();
     if (!meta) return;
     const rawText = typeof message === "string" ? message : new TextDecoder().decode(message);
-    let env;
+    let parsed;
     try {
-      env = JSON.parse(rawText);
+      parsed = JSON.parse(rawText);
     } catch {
       return;
     }
-    if (env.groupHash !== meta.groupHash) return;
-    env.senderDeviceID = meta.deviceID;
-    const stored = this.appendEnvelope(env);
+    if (parsed.type === "ping") {
+      try {
+        ws.send(JSON.stringify({ type: "pong", timeMs: Date.now() }));
+      } catch {
+      }
+      return;
+    }
+    if (parsed.groupHash !== meta.groupHash) return;
+    parsed.senderDeviceID = meta.deviceID;
+    const stored = this.appendEnvelope(parsed);
     this.broadcastEnvelope(meta.deviceID, stored);
   }
   async webSocketClose(ws) {
+    try {
+      ws.close();
+    } catch {
+    }
+  }
+  async webSocketError(ws) {
     try {
       ws.close();
     } catch {
@@ -1536,7 +2300,7 @@ var RelayGroupDO = class extends DurableObject {
     if (!SAFE_ID_REGEX.test(blobID) || !SAFE_ID_REGEX.test(groupHash)) {
       return apiError(400, "invalid_params", "invalid blobID or group");
     }
-    const r2Key = `${groupHash}/${blobID}`;
+    const r2Key = `blobs/${groupHash}/${blobID}`;
     if (request.method === "POST" || request.method === "PUT") {
       const data = new Uint8Array(await request.arrayBuffer());
       if (data.byteLength > this.maxBlobBytes()) {
@@ -1568,31 +2332,48 @@ var RelayGroupDO = class extends DurableObject {
     }
     if (request.method === "GET") {
       if (this.env.BLOBS) {
-        const obj = await this.env.BLOBS.get(r2Key);
+        const obj = await this.env.BLOBS.get(r2Key) || await this.env.BLOBS.get(`${groupHash}/${blobID}`);
         if (!obj) return apiError(404, "not_found", "blob not found");
         return new Response(obj.body, {
           status: 200,
           headers: { "Content-Type": "application/octet-stream" }
         });
       }
-      const rows = this.ctx.storage.sql.exec(
-        "SELECT data FROM blob_chunks WHERE blob_id = ? ORDER BY chunk_idx ASC",
+      const countRow = this.ctx.storage.sql.exec(
+        "SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(data)), 0) AS total FROM blob_chunks WHERE blob_id = ?",
         blobID
-      ).toArray();
-      if (rows.length === 0) {
+      ).one();
+      if (!countRow || countRow.cnt === 0) {
         return apiError(404, "not_found", "blob not found");
       }
-      let total = 0;
-      for (const r of rows) total += r.data.byteLength;
-      const merged = new Uint8Array(total);
-      let offset = 0;
-      for (const r of rows) {
-        merged.set(new Uint8Array(r.data), offset);
-        offset += r.data.byteLength;
-      }
-      return new Response(merged, {
+      const sql = this.ctx.storage.sql;
+      let idx = 0;
+      const totalChunks = Number(countRow.cnt);
+      const stream = new ReadableStream({
+        pull(controller) {
+          if (idx >= totalChunks) {
+            controller.close();
+            return;
+          }
+          const row = sql.exec(
+            "SELECT data FROM blob_chunks WHERE blob_id = ? AND chunk_idx = ?",
+            blobID,
+            idx
+          ).toArray()[0];
+          idx += 1;
+          if (!row) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(new Uint8Array(row.data));
+        }
+      });
+      return new Response(stream, {
         status: 200,
-        headers: { "Content-Type": "application/octet-stream" }
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "Content-Length": String(countRow.total)
+        }
       });
     }
     return apiError(405, "method_not_allowed", "method not allowed");
@@ -1660,55 +2441,71 @@ var SignalingRoomDO = class extends DurableObject {
   static {
     __name(this, "SignalingRoomDO");
   }
+  schemaReady = false;
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.ctx.setWebSocketAutoResponse(
+      new WebSocketRequestResponsePair('{"type":"ping"}', '{"type":"pong"}')
+    );
+  }
+  ensureSchema() {
+    if (this.schemaReady) return;
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS room_devices (
+        device_id TEXT PRIMARY KEY,
+        device_json TEXT NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS sealed_group_keys (
+        target_device_id TEXT PRIMARY KEY,
+        envelope_json TEXT NOT NULL,
+        key_updated_at_ms INTEGER NOT NULL
+      );
+    `);
+    this.schemaReady = true;
+  }
+  upsertRoomDevice(dev) {
+    if (!SAFE_ID_REGEX.test(dev.deviceID) || !dev.signingPublicKeyBase64) return;
+    this.ensureSchema();
+    const existingRow = this.ctx.storage.sql.exec(
+      "SELECT device_json FROM room_devices WHERE device_id = ?",
+      dev.deviceID
+    ).toArray()[0];
+    let merged = { ...dev, updatedAtMs: Date.now() };
+    if (existingRow) {
+      try {
+        const prev = JSON.parse(existingRow.device_json);
+        if (!merged.x25519PublicKeyBase64 && prev.x25519PublicKeyBase64) {
+          merged.x25519PublicKeyBase64 = prev.x25519PublicKeyBase64;
+          merged.x25519SignatureBase64 = prev.x25519SignatureBase64;
+        }
+        if (merged.accountCert === void 0 && prev.accountCert !== void 0) {
+          merged.accountCert = prev.accountCert;
+        }
+      } catch {
+      }
+    }
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO room_devices (device_id, device_json, updated_at_ms) VALUES (?, ?, ?)",
+      merged.deviceID,
+      JSON.stringify(merged),
+      merged.updatedAtMs
+    );
+    this.ctx.storage.sql.exec(`
+      DELETE FROM room_devices WHERE device_id NOT IN (
+        SELECT device_id FROM room_devices ORDER BY updated_at_ms DESC LIMIT 32
+      )
+    `);
+  }
   async fetch(request) {
+    this.ensureSchema();
     const url = new URL(request.url);
     const userID = request.headers.get("X-SyncNow-Room-ID") || "unknown";
     if (url.pathname === "/v1/signal/ws") {
-      if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
-        return apiError(426, "upgrade_required", "Expected Upgrade: websocket");
-      }
-      const deviceID = (url.searchParams.get("device") || "").trim();
-      if (!SAFE_ID_REGEX.test(deviceID)) {
-        return apiError(400, "invalid_device", "valid device query parameter is required");
-      }
-      for (const existing of this.ctx.getWebSockets(deviceID)) {
-        try {
-          existing.close(1e3, "Replaced by newer connection");
-        } catch {
-        }
-      }
-      const observedIP = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "";
-      const pair = new WebSocketPair();
-      const [client, server] = Object.values(pair);
-      this.ctx.acceptWebSocket(server, [deviceID]);
-      const initialAttachment = {
-        userID,
-        deviceID,
-        observedPublicIP: observedIP,
-        presence: {
-          deviceID,
-          deviceName: deviceID,
-          platform: "macOS",
-          signingPublicKeyBase64: "",
-          lanEndpoints: [],
-          observedPublicIP: observedIP || void 0,
-          tcpPort: 51820,
-          udpPort: 0,
-          appVersion: "0.1.0",
-          online: true,
-          updatedAtMs: Date.now()
-        }
-      };
-      server.serializeAttachment(initialAttachment);
-      const peers = this.collectOnlinePeers(deviceID);
-      const snapshot = {
-        type: "peers_snapshot",
-        userID,
-        peers,
-        timeMs: Date.now()
-      };
-      server.send(JSON.stringify(snapshot));
-      return new Response(null, { status: 101, webSocket: client });
+      return this.handleSignalWebSocket(request, url, userID);
+    }
+    if (url.pathname === "/v1/tunnel/ws") {
+      return this.handleTunnelWebSocket(request, url, userID);
     }
     if (url.pathname === "/v1/signal/peers" && request.method === "GET") {
       const exclude = (url.searchParams.get("excludeDevice") || "").trim();
@@ -1718,11 +2515,218 @@ var SignalingRoomDO = class extends DurableObject {
         timeMs: Date.now()
       });
     }
+    if (url.pathname === "/v1/signal/group-vault") {
+      return this.handleGroupVault(request, url, userID);
+    }
     return apiError(404, "not_found", "Not found");
+  }
+  handleSignalWebSocket(request, url, userID) {
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return apiError(426, "upgrade_required", "Expected Upgrade: websocket");
+    }
+    const deviceID = (url.searchParams.get("device") || "").trim();
+    if (!SAFE_ID_REGEX.test(deviceID)) {
+      return apiError(400, "invalid_device", "valid device query parameter is required");
+    }
+    for (const existing of this.ctx.getWebSockets(`sig:${deviceID}`)) {
+      try {
+        existing.close(1e3, "Replaced by newer connection");
+      } catch {
+      }
+    }
+    const observedIP = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "";
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.ctx.acceptWebSocket(server, [`sig:${deviceID}`]);
+    const initialAttachment = {
+      kind: "signal",
+      userID,
+      deviceID,
+      observedPublicIP: observedIP,
+      presence: {
+        deviceID,
+        deviceName: deviceID,
+        platform: "macOS",
+        signingPublicKeyBase64: "",
+        lanEndpoints: [],
+        observedPublicIP: observedIP || void 0,
+        tcpPort: 51820,
+        udpPort: 0,
+        appVersion: "0.1.0",
+        online: true,
+        updatedAtMs: Date.now()
+      }
+    };
+    server.serializeAttachment(initialAttachment);
+    const peers = this.collectOnlinePeers(deviceID);
+    const snapshot = {
+      type: "peers_snapshot",
+      userID,
+      peers,
+      timeMs: Date.now()
+    };
+    server.send(JSON.stringify(snapshot));
+    return new Response(null, { status: 101, webSocket: client });
+  }
+  handleTunnelWebSocket(request, url, userID) {
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return apiError(426, "upgrade_required", "Expected Upgrade: websocket");
+    }
+    const tunnelID = (url.searchParams.get("tunnel") || "").trim();
+    const deviceID = (url.searchParams.get("device") || "").trim();
+    const peerID = (url.searchParams.get("peer") || "").trim();
+    const role = (url.searchParams.get("role") || "").trim();
+    if (!SAFE_ID_REGEX.test(tunnelID) || !SAFE_ID_REGEX.test(deviceID) || !SAFE_ID_REGEX.test(peerID) || deviceID === peerID) {
+      return apiError(400, "invalid_params", "valid tunnel, device, and peer parameters are required");
+    }
+    if (role !== "dial" && role !== "accept") {
+      return apiError(400, "invalid_role", "role must be dial or accept");
+    }
+    const myTag = `tun:${tunnelID}:${role}`;
+    if (this.ctx.getWebSockets(myTag).length > 0) {
+      return apiError(409, "slot_taken", "tunnel role already occupied");
+    }
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.ctx.acceptWebSocket(server, [myTag]);
+    const att = {
+      kind: "tunnel",
+      userID,
+      tunnelID,
+      deviceID,
+      peerID,
+      role
+    };
+    server.serializeAttachment(att);
+    const partnerTag = `tun:${tunnelID}:${role === "dial" ? "accept" : "dial"}`;
+    const partners = this.ctx.getWebSockets(partnerTag);
+    if (partners.length > 0) {
+      const readyText = JSON.stringify({ type: "tunnel_ready" });
+      try {
+        partners[0].send(readyText);
+        server.send(readyText);
+      } catch {
+      }
+    }
+    return new Response(null, { status: 101, webSocket: client });
+  }
+  async handleGroupVault(request, url, userID) {
+    if (request.method === "GET") {
+      const deviceID = (url.searchParams.get("device") || "").trim();
+      if (!SAFE_ID_REGEX.test(deviceID)) {
+        return apiError(400, "invalid_device", "valid device query parameter is required");
+      }
+      const devRows = this.ctx.storage.sql.exec("SELECT device_json FROM room_devices ORDER BY device_id ASC").toArray();
+      const devices = [];
+      for (const r of devRows) {
+        try {
+          devices.push(JSON.parse(r.device_json));
+        } catch {
+        }
+      }
+      const envRow = this.ctx.storage.sql.exec(
+        "SELECT envelope_json FROM sealed_group_keys WHERE target_device_id = ?",
+        deviceID
+      ).toArray()[0];
+      let envelopeForMe = null;
+      if (envRow) {
+        try {
+          envelopeForMe = JSON.parse(envRow.envelope_json);
+        } catch {
+        }
+      }
+      return jsonResponse({
+        userID,
+        devices,
+        envelopeForMe,
+        timeMs: Date.now()
+      });
+    }
+    if (request.method === "PUT" || request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!body) return apiError(400, "invalid_json", "invalid json payload");
+      if (body.device && SAFE_ID_REGEX.test(body.device.deviceID)) {
+        this.upsertRoomDevice(body.device);
+      }
+      const senderID = (body.senderDeviceID || body.device?.deviceID || "").trim();
+      let notified = 0;
+      if (SAFE_ID_REGEX.test(senderID) && Array.isArray(body.envelopes)) {
+        const now = Date.now();
+        for (const env of body.envelopes) {
+          if (!SAFE_ID_REGEX.test(env.targetDeviceID) || !env.ciphertextBase64 || !env.ephemeralX25519PubBase64) {
+            continue;
+          }
+          const prev = this.ctx.storage.sql.exec(
+            "SELECT key_updated_at_ms FROM sealed_group_keys WHERE target_device_id = ?",
+            env.targetDeviceID
+          ).toArray()[0];
+          if (prev && prev.key_updated_at_ms > (env.keyUpdatedAtMs || 0)) {
+            continue;
+          }
+          const stored = {
+            ...env,
+            senderDeviceID: senderID,
+            createdAtMs: now
+          };
+          this.ctx.storage.sql.exec(
+            "INSERT OR REPLACE INTO sealed_group_keys (target_device_id, envelope_json, key_updated_at_ms) VALUES (?, ?, ?)",
+            env.targetDeviceID,
+            JSON.stringify(stored),
+            env.keyUpdatedAtMs || now
+          );
+          const targetSocks = this.ctx.getWebSockets(`sig:${env.targetDeviceID}`);
+          if (targetSocks.length > 0) {
+            const wake = {
+              type: "signal",
+              userID,
+              fromDeviceID: senderID,
+              kind: "group_vault_updated",
+              payload: "{}",
+              timeMs: now
+            };
+            const wakeJSON = JSON.stringify(wake);
+            for (const s of targetSocks) {
+              try {
+                s.send(wakeJSON);
+                notified += 1;
+              } catch {
+              }
+            }
+          }
+        }
+      }
+      return jsonResponse({ ok: true, notified });
+    }
+    return apiError(405, "method_not_allowed", "method not allowed");
   }
   async webSocketMessage(ws, message) {
     const att = ws.deserializeAttachment();
     if (!att) return;
+    if (att.kind === "tunnel") {
+      if (typeof message !== "string") {
+        const partnerRole = att.role === "dial" ? "accept" : "dial";
+        const partners = this.ctx.getWebSockets(`tun:${att.tunnelID}:${partnerRole}`);
+        for (const p of partners) {
+          try {
+            p.send(message);
+          } catch {
+            try {
+              p.close();
+            } catch {
+            }
+          }
+        }
+        return;
+      }
+      try {
+        const ctrl = JSON.parse(message);
+        if (ctrl.type === "ping") {
+          ws.send(JSON.stringify({ type: "pong", timeMs: Date.now() }));
+        }
+      } catch {
+      }
+      return;
+    }
     const raw = typeof message === "string" ? message : new TextDecoder().decode(message);
     let msg;
     try {
@@ -1739,6 +2743,18 @@ var SignalingRoomDO = class extends DurableObject {
         updatedAtMs: Date.now()
       };
       ws.serializeAttachment({ ...att, presence: updatedPresence });
+      if (updatedPresence.signingPublicKeyBase64) {
+        this.upsertRoomDevice({
+          deviceID: att.deviceID,
+          deviceName: updatedPresence.deviceName,
+          platform: updatedPresence.platform,
+          signingPublicKeyBase64: updatedPresence.signingPublicKeyBase64,
+          x25519PublicKeyBase64: updatedPresence.x25519PublicKeyBase64,
+          x25519SignatureBase64: updatedPresence.x25519SignatureBase64,
+          accountCert: updatedPresence.accountCert,
+          updatedAtMs: Date.now()
+        });
+      }
       const upsert = {
         type: "peer_upsert",
         userID: att.userID,
@@ -1748,6 +2764,8 @@ var SignalingRoomDO = class extends DurableObject {
       const encoded = JSON.stringify(upsert);
       for (const peerSock of this.ctx.getWebSockets()) {
         if (peerSock === ws) continue;
+        const peerAtt = peerSock.deserializeAttachment();
+        if (!peerAtt || peerAtt.kind === "tunnel") continue;
         try {
           peerSock.send(encoded);
         } catch {
@@ -1756,7 +2774,7 @@ var SignalingRoomDO = class extends DurableObject {
       return;
     }
     if (msg.type === "signal" && msg.targetDeviceID && msg.targetDeviceID !== att.deviceID) {
-      const targets = this.ctx.getWebSockets(msg.targetDeviceID);
+      const targets = this.ctx.getWebSockets(`sig:${msg.targetDeviceID}`);
       if (targets.length === 0) return;
       const fwd = {
         type: "signal",
@@ -1781,18 +2799,30 @@ var SignalingRoomDO = class extends DurableObject {
     }
   }
   async webSocketClose(ws) {
-    this.broadcastOffline(ws);
+    this.handleSocketEnd(ws);
   }
   async webSocketError(ws) {
-    this.broadcastOffline(ws);
+    this.handleSocketEnd(ws);
   }
-  broadcastOffline(ws) {
+  handleSocketEnd(ws) {
     const att = ws.deserializeAttachment();
     try {
       ws.close();
     } catch {
     }
     if (!att) return;
+    if (att.kind === "tunnel") {
+      const partnerRole = att.role === "dial" ? "accept" : "dial";
+      for (const p of this.ctx.getWebSockets(`tun:${att.tunnelID}:${partnerRole}`)) {
+        try {
+          p.close(1e3, "Peer tunnel closed");
+        } catch {
+        }
+      }
+      return;
+    }
+    const hasReplacement = this.ctx.getWebSockets(`sig:${att.deviceID}`).some((other) => other !== ws && other.readyState === 1);
+    if (hasReplacement) return;
     const offline = {
       type: "peer_offline",
       userID: att.userID,
@@ -1803,7 +2833,7 @@ var SignalingRoomDO = class extends DurableObject {
     for (const sock of this.ctx.getWebSockets()) {
       if (sock === ws) continue;
       const peerAtt = sock.deserializeAttachment();
-      if (peerAtt?.deviceID === att.deviceID) continue;
+      if (!peerAtt || peerAtt.kind === "tunnel" || peerAtt.deviceID === att.deviceID) continue;
       try {
         sock.send(encoded);
       } catch {
@@ -1814,7 +2844,7 @@ var SignalingRoomDO = class extends DurableObject {
     const out = [];
     for (const sock of this.ctx.getWebSockets()) {
       const att = sock.deserializeAttachment();
-      if (!att || !att.presence?.deviceID) continue;
+      if (!att || att.kind === "tunnel" || !att.presence?.deviceID) continue;
       if (excludeDeviceID && att.deviceID === excludeDeviceID) continue;
       out.push(att.presence);
     }
@@ -1838,9 +2868,166 @@ var MetaStoreDO = class extends DurableObject {
   static {
     __name(this, "MetaStoreDO");
   }
+  schemaReady = false;
+  cachedTicketSecret = null;
+  ensureSchema() {
+    if (this.schemaReady) return;
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS device_tokens (
+        id TEXT PRIMARY KEY,
+        label TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        token_preview TEXT NOT NULL,
+        room_id TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        expires_at_ms INTEGER NOT NULL DEFAULT 0,
+        last_used_at_ms INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS tmp_transfers (
+        transfer_id TEXT PRIMARY KEY,
+        group_hash TEXT NOT NULL,
+        sender_device_id TEXT NOT NULL,
+        storage_backend TEXT NOT NULL,
+        r2_key TEXT NOT NULL,
+        r2_upload_id TEXT NOT NULL DEFAULT '',
+        total_plain_bytes INTEGER NOT NULL,
+        total_cipher_bytes INTEGER NOT NULL,
+        chunk_plain_bytes INTEGER NOT NULL,
+        chunk_cipher_bytes INTEGER NOT NULL,
+        total_chunks INTEGER NOT NULL,
+        uploaded_parts_json TEXT NOT NULL DEFAULT '{}',
+        acked_devices_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        expires_at_ms INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_tmp_expires ON tmp_transfers(expires_at_ms);
+    `);
+    this.schemaReady = true;
+  }
+  async getTicketSecret() {
+    if (this.cachedTicketSecret) return this.cachedTicketSecret;
+    let secret = await this.ctx.storage.get("tmp_ticket_secret");
+    if (!secret || secret.length < 32) {
+      secret = randomHex(32);
+      await this.ctx.storage.put("tmp_ticket_secret", secret);
+    }
+    this.cachedTicketSecret = secret;
+    return secret;
+  }
+  async deletePhysicalTmpRow(row) {
+    if (row.storage_backend === "r2" && this.env.BLOBS) {
+      if (row.status === "uploading" && row.r2_upload_id) {
+        try {
+          await this.env.BLOBS.resumeMultipartUpload(row.r2_key, row.r2_upload_id).abort();
+        } catch {
+        }
+      }
+      try {
+        await this.env.BLOBS.delete(row.r2_key);
+      } catch {
+      }
+    } else if (row.storage_backend === "do_sqlite") {
+      try {
+        const stub = this.env.RELAY_GROUP.get(this.env.RELAY_GROUP.idFromName(row.group_hash));
+        await stub.fetch(`https://internal/internal/do-tmp/${row.transfer_id}`, { method: "DELETE" });
+      } catch {
+      }
+    }
+    this.ctx.storage.sql.exec("DELETE FROM tmp_transfers WHERE transfer_id = ?", row.transfer_id);
+  }
+  usedTmpBytes() {
+    const r = this.ctx.storage.sql.exec("SELECT COALESCE(SUM(total_cipher_bytes), 0) AS total FROM tmp_transfers").one();
+    return Number(r.total || 0);
+  }
+  async sweepExpiredTmp() {
+    const now = Date.now();
+    const staleUploadCutoff = now - 60 * 60 * 1e3;
+    const expired = this.ctx.storage.sql.exec(
+      `SELECT * FROM tmp_transfers
+         WHERE expires_at_ms <= ? OR (status = 'uploading' AND created_at_ms < ?)`,
+      now,
+      staleUploadCutoff
+    ).toArray();
+    for (const row of expired) {
+      await this.deletePhysicalTmpRow(row);
+    }
+  }
+  async evictForSpace(neededBytes, maxTotalBytes) {
+    await this.sweepExpiredTmp();
+    if (this.usedTmpBytes() + neededBytes <= maxTotalBytes) return;
+    const candidates = this.ctx.storage.sql.exec(`SELECT * FROM tmp_transfers WHERE status = 'ready' ORDER BY expires_at_ms ASC`).toArray();
+    candidates.sort((a, b) => {
+      const ackA = a.acked_devices_json !== "[]" ? 0 : 1;
+      const ackB = b.acked_devices_json !== "[]" ? 0 : 1;
+      if (ackA !== ackB) return ackA - ackB;
+      return a.expires_at_ms - b.expires_at_ms;
+    });
+    for (const cand of candidates) {
+      if (this.usedTmpBytes() + neededBytes <= maxTotalBytes) break;
+      await this.deletePhysicalTmpRow(cand);
+    }
+  }
+  async scheduleCleanupAlarm() {
+    const cur = await this.ctx.storage.getAlarm();
+    if (!cur) {
+      await this.ctx.storage.setAlarm(Date.now() + 30 * 60 * 1e3);
+    }
+  }
+  async alarm() {
+    this.ensureSchema();
+    await this.sweepExpiredTmp();
+    const remaining = this.ctx.storage.sql.exec("SELECT COUNT(*) AS cnt FROM tmp_transfers").one();
+    if (Number(remaining.cnt) > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + 30 * 60 * 1e3);
+    }
+  }
+  buildTmpStats(cfg) {
+    const rows = this.ctx.storage.sql.exec(
+      "SELECT status, total_cipher_bytes FROM tmp_transfers"
+    ).toArray();
+    let activeFiles = 0;
+    let uploadingFiles = 0;
+    let usedBytes = 0;
+    for (const r of rows) {
+      usedBytes += Number(r.total_cipher_bytes || 0);
+      if (r.status === "ready") activeFiles += 1;
+      else uploadingFiles += 1;
+    }
+    return {
+      storageBackend: this.env.BLOBS ? "r2" : "do_sqlite",
+      activeFiles,
+      uploadingFiles,
+      usedBytes,
+      maxTmpFileMB: cfg.maxTmpFileMB,
+      maxTmpTotalMB: cfg.maxTmpTotalMB,
+      tmpTTLHours: cfg.tmpTTLHours,
+      tmpAckGraceMinutes: cfg.tmpAckGraceMinutes
+    };
+  }
+  listPublicDeviceTokens() {
+    const rows = this.ctx.storage.sql.exec(
+      `SELECT id, label, token_preview, room_id, created_at_ms, expires_at_ms, last_used_at_ms
+         FROM device_tokens ORDER BY created_at_ms DESC`
+    ).toArray();
+    return rows.map((r) => ({
+      id: r.id,
+      label: r.label,
+      tokenPreview: r.token_preview,
+      roomID: r.room_id,
+      createdAtMs: r.created_at_ms,
+      expiresAtMs: r.expires_at_ms || void 0,
+      lastUsedAtMs: r.last_used_at_ms || void 0
+    }));
+  }
   async fetch(request) {
+    this.ensureSchema();
     const url = new URL(request.url);
-    if (url.pathname === "/internal/config") {
+    const path = url.pathname;
+    if (path === "/internal/ticket-secret") {
+      return jsonResponse({ secretHex: await this.getTicketSecret() });
+    }
+    if (path === "/internal/config") {
       if (request.method === "GET") {
         const cfg = await this.ctx.storage.get("relay_config");
         return jsonResponse(cfg ?? null);
@@ -1852,10 +3039,326 @@ var MetaStoreDO = class extends DurableObject {
       }
       if (request.method === "DELETE") {
         await this.ctx.storage.delete("relay_config");
+        this.ctx.storage.sql.exec("DELETE FROM device_tokens");
         return jsonResponse({ ok: true });
       }
     }
-    if (url.pathname === "/v1/updates/check" && request.method === "GET") {
+    if (path === "/internal/admin-summary" && request.method === "POST") {
+      const cfg = await request.json();
+      await this.sweepExpiredTmp();
+      return jsonResponse({
+        tmpStats: this.buildTmpStats(cfg),
+        deviceTokens: this.listPublicDeviceTokens()
+      });
+    }
+    if (path === "/internal/purge-tmp" && request.method === "POST") {
+      const cfg = await request.json();
+      const all = this.ctx.storage.sql.exec("SELECT * FROM tmp_transfers").toArray();
+      let freedBytes = 0;
+      for (const row of all) {
+        freedBytes += Number(row.total_cipher_bytes || 0);
+        await this.deletePhysicalTmpRow(row);
+      }
+      return jsonResponse({
+        ok: true,
+        purgedCount: all.length,
+        freedBytes,
+        tmpStats: this.buildTmpStats(cfg)
+      });
+    }
+    if (path === "/internal/device-tokens/verify" && request.method === "POST") {
+      const { tokenHash } = await request.json();
+      const row = this.ctx.storage.sql.exec(
+        "SELECT id, room_id, expires_at_ms, last_used_at_ms FROM device_tokens WHERE token_hash = ?",
+        tokenHash
+      ).toArray()[0];
+      const now = Date.now();
+      if (!row || row.expires_at_ms > 0 && now >= row.expires_at_ms) {
+        return jsonResponse({ valid: false });
+      }
+      if (now - row.last_used_at_ms > 6e4) {
+        this.ctx.storage.sql.exec(
+          "UPDATE device_tokens SET last_used_at_ms = ? WHERE id = ?",
+          now,
+          row.id
+        );
+      }
+      return jsonResponse({ valid: true, record: { id: row.id, roomID: row.room_id } });
+    }
+    if (path === "/internal/device-tokens" && request.method === "GET") {
+      return jsonResponse({ tokens: this.listPublicDeviceTokens() });
+    }
+    if (path === "/internal/device-tokens/issue" && request.method === "POST") {
+      const { label, roomID, ttlDays } = await request.json();
+      const rawToken = DEVICE_TOKEN_PREFIX + randomHex(24);
+      const tokenHash = await sha256Hex(rawToken);
+      const id = "dt_" + randomHex(8);
+      const now = Date.now();
+      const exp = ttlDays && ttlDays > 0 ? now + ttlDays * 24 * 60 * 60 * 1e3 : 0;
+      const preview = `${rawToken.slice(0, 14)}\u2026${rawToken.slice(-4)}`;
+      const cleanLabel = (label || "Mobile / QR Device").trim() || "Mobile / QR Device";
+      this.ctx.storage.sql.exec(
+        `INSERT INTO device_tokens (id, label, token_hash, token_preview, room_id, created_at_ms, expires_at_ms, last_used_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+        id,
+        cleanLabel,
+        tokenHash,
+        preview,
+        roomID || "static-owner",
+        now,
+        exp
+      );
+      this.ctx.storage.sql.exec(`
+        DELETE FROM device_tokens WHERE id NOT IN (
+          SELECT id FROM device_tokens ORDER BY created_at_ms DESC LIMIT 64
+        )
+      `);
+      return jsonResponse({
+        token: rawToken,
+        record: {
+          id,
+          label: cleanLabel,
+          tokenPreview: preview,
+          roomID: roomID || "static-owner",
+          createdAtMs: now,
+          expiresAtMs: exp || void 0
+        }
+      });
+    }
+    if (path.startsWith("/internal/device-tokens/") && request.method === "DELETE") {
+      const id = path.slice("/internal/device-tokens/".length);
+      this.ctx.storage.sql.exec("DELETE FROM device_tokens WHERE id = ?", id);
+      return jsonResponse({ ok: true });
+    }
+    if (path === "/internal/tmp/init" && request.method === "POST") {
+      const body = await request.json();
+      const chunkPlain = body.chunkPlainBytes || DEFAULT_TMP_CHUNK_PLAIN_BYTES;
+      if (chunkPlain < 64 * 1024 || chunkPlain > 32 * 1024 * 1024) {
+        return apiError(400, "invalid_chunk_size", "chunkPlainBytes must be between 64KB and 32MB");
+      }
+      const expectedChunks = Math.ceil(body.totalPlainBytes / chunkPlain);
+      if (body.totalPlainBytes <= 0 || body.totalChunks <= 0 || body.totalChunks !== expectedChunks || body.totalChunks > MAX_TMP_CHUNKS_PER_TRANSFER) {
+        return apiError(400, "invalid_chunks", "invalid totalPlainBytes or totalChunks");
+      }
+      const expectedCipher = body.totalPlainBytes + body.totalChunks * TMP_CHUNK_AEAD_TAG_BYTES;
+      if (body.totalCipherBytes !== expectedCipher) {
+        return apiError(400, "invalid_cipher_size", "totalCipherBytes mismatch");
+      }
+      const maxFileBytes = body.cfg.maxTmpFileMB * 1024 * 1024;
+      if (body.totalCipherBytes > maxFileBytes) {
+        return apiError(
+          413,
+          "file_too_large",
+          `file exceeds maxTmpFileMB (${body.cfg.maxTmpFileMB} MB)`
+        );
+      }
+      const now = Date.now();
+      const existing = this.ctx.storage.sql.exec("SELECT * FROM tmp_transfers WHERE transfer_id = ?", body.transferID).toArray()[0];
+      const secret = await this.getTicketSecret();
+      if (existing && existing.group_hash === body.groupHash && now < existing.expires_at_ms) {
+        const partsMap = JSON.parse(existing.uploaded_parts_json || "{}");
+        const uploadedChunks = Object.keys(partsMap).map((k) => Number(k)).sort((a, b) => a - b);
+        const ticket2 = await signTmpTicket(secret, {
+          tid: existing.transfer_id,
+          grp: existing.group_hash,
+          backend: existing.storage_backend,
+          r2Key: existing.r2_key,
+          uploadId: existing.r2_upload_id || void 0,
+          chunkCipher: existing.chunk_cipher_bytes,
+          totalCipher: existing.total_cipher_bytes,
+          totalChunks: existing.total_chunks,
+          exp: existing.expires_at_ms
+        });
+        return jsonResponse({
+          transferID: existing.transfer_id,
+          storageBackend: existing.storage_backend,
+          chunkPlainBytes: existing.chunk_plain_bytes,
+          chunkCipherBytes: existing.chunk_cipher_bytes,
+          totalChunks: existing.total_chunks,
+          expiresAtMs: existing.expires_at_ms,
+          ticket: ticket2,
+          uploadedChunks,
+          status: existing.status
+        });
+      }
+      const maxTotalBytes = body.cfg.maxTmpTotalMB * 1024 * 1024;
+      await this.evictForSpace(body.totalCipherBytes, maxTotalBytes);
+      if (this.usedTmpBytes() + body.totalCipherBytes > maxTotalBytes) {
+        return apiError(
+          507,
+          "quota_exceeded",
+          `relay tmp storage full (limit ${body.cfg.maxTmpTotalMB} MB)`
+        );
+      }
+      const backend = this.env.BLOBS ? "r2" : "do_sqlite";
+      const r2Key = `tmp/${body.groupHash}/${body.transferID}`;
+      let r2UploadID = "";
+      if (backend === "r2" && this.env.BLOBS && body.totalChunks > 1) {
+        const mpu = await this.env.BLOBS.createMultipartUpload(r2Key, {
+          httpMetadata: { contentType: "application/octet-stream" },
+          customMetadata: {
+            groupHash: body.groupHash,
+            createdAtMs: String(now)
+          }
+        });
+        r2UploadID = mpu.uploadId;
+      }
+      const ttlHours = body.ttlHours && body.ttlHours > 0 && body.ttlHours < body.cfg.tmpTTLHours ? body.ttlHours : body.cfg.tmpTTLHours;
+      const expiresAtMs = now + ttlHours * 60 * 60 * 1e3;
+      const chunkCipher = chunkPlain + TMP_CHUNK_AEAD_TAG_BYTES;
+      this.ctx.storage.sql.exec(
+        `INSERT OR REPLACE INTO tmp_transfers (
+          transfer_id, group_hash, sender_device_id, storage_backend, r2_key, r2_upload_id,
+          total_plain_bytes, total_cipher_bytes, chunk_plain_bytes, chunk_cipher_bytes,
+          total_chunks, uploaded_parts_json, acked_devices_json, status, created_at_ms, expires_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '[]', 'uploading', ?, ?)`,
+        body.transferID,
+        body.groupHash,
+        body.senderDeviceID || "",
+        backend,
+        r2Key,
+        r2UploadID,
+        body.totalPlainBytes,
+        body.totalCipherBytes,
+        chunkPlain,
+        chunkCipher,
+        body.totalChunks,
+        now,
+        expiresAtMs
+      );
+      await this.scheduleCleanupAlarm();
+      const ticket = await signTmpTicket(secret, {
+        tid: body.transferID,
+        grp: body.groupHash,
+        backend,
+        r2Key,
+        uploadId: r2UploadID || void 0,
+        chunkCipher,
+        totalCipher: body.totalCipherBytes,
+        totalChunks: body.totalChunks,
+        exp: expiresAtMs
+      });
+      return jsonResponse({
+        transferID: body.transferID,
+        storageBackend: backend,
+        chunkPlainBytes: chunkPlain,
+        chunkCipherBytes: chunkCipher,
+        totalChunks: body.totalChunks,
+        expiresAtMs,
+        ticket,
+        uploadedChunks: [],
+        status: "uploading"
+      });
+    }
+    if (path === "/internal/tmp/record-part" && request.method === "POST") {
+      const { transferID, partIndex, etag } = await request.json();
+      const row = this.ctx.storage.sql.exec("SELECT * FROM tmp_transfers WHERE transfer_id = ?", transferID).toArray()[0];
+      if (!row) return apiError(404, "not_found", "transfer not found");
+      const map = JSON.parse(row.uploaded_parts_json || "{}");
+      map[String(partIndex)] = etag;
+      this.ctx.storage.sql.exec(
+        "UPDATE tmp_transfers SET uploaded_parts_json = ? WHERE transfer_id = ?",
+        JSON.stringify(map),
+        transferID
+      );
+      return jsonResponse({ ok: true });
+    }
+    if (path === "/internal/tmp/complete" && request.method === "POST") {
+      const { transferID, groupHash, parts } = await request.json();
+      const row = this.ctx.storage.sql.exec("SELECT * FROM tmp_transfers WHERE transfer_id = ?", transferID).toArray()[0];
+      if (!row || groupHash && row.group_hash !== groupHash) {
+        return apiError(404, "not_found", "transfer not found");
+      }
+      const secret = await this.getTicketSecret();
+      const ticket = await signTmpTicket(secret, {
+        tid: row.transfer_id,
+        grp: row.group_hash,
+        backend: row.storage_backend,
+        r2Key: row.r2_key,
+        chunkCipher: row.chunk_cipher_bytes,
+        totalCipher: row.total_cipher_bytes,
+        totalChunks: row.total_chunks,
+        exp: row.expires_at_ms
+      });
+      if (row.status === "ready") {
+        return jsonResponse({ ok: true, transferID, expiresAtMs: row.expires_at_ms, ticket });
+      }
+      if (row.storage_backend === "r2" && this.env.BLOBS && row.total_chunks > 1) {
+        const uploadedList = parts && parts.length === row.total_chunks ? parts : Object.entries(JSON.parse(row.uploaded_parts_json || "{}")).map(
+          ([idx, etag]) => ({ partNumber: Number(idx) + 1, etag })
+        );
+        if (uploadedList.length < row.total_chunks) {
+          return apiError(400, "incomplete_parts", "missing uploaded parts");
+        }
+        uploadedList.sort((a, b) => a.partNumber - b.partNumber);
+        const mpu = this.env.BLOBS.resumeMultipartUpload(row.r2_key, row.r2_upload_id);
+        await mpu.complete(uploadedList);
+      } else if (row.storage_backend === "do_sqlite") {
+        const map = JSON.parse(row.uploaded_parts_json || "{}");
+        if (Object.keys(map).length < row.total_chunks) {
+          return apiError(400, "incomplete_parts", "missing uploaded parts");
+        }
+      }
+      this.ctx.storage.sql.exec(
+        `UPDATE tmp_transfers SET status = 'ready', r2_upload_id = '' WHERE transfer_id = ?`,
+        transferID
+      );
+      return jsonResponse({ ok: true, transferID, expiresAtMs: row.expires_at_ms, ticket });
+    }
+    if (path.startsWith("/internal/tmp/lookup/") && request.method === "GET") {
+      const transferID = path.slice("/internal/tmp/lookup/".length);
+      const groupHash = (url.searchParams.get("group") || "").trim();
+      const row = this.ctx.storage.sql.exec("SELECT * FROM tmp_transfers WHERE transfer_id = ?", transferID).toArray()[0];
+      if (!row || row.status !== "ready" || Date.now() >= row.expires_at_ms || groupHash && row.group_hash !== groupHash) {
+        return apiError(404, "not_found", "tmp blob not found or expired");
+      }
+      return jsonResponse({
+        tid: row.transfer_id,
+        grp: row.group_hash,
+        backend: row.storage_backend,
+        r2Key: row.r2_key,
+        chunkCipher: row.chunk_cipher_bytes,
+        totalCipher: row.total_cipher_bytes,
+        totalChunks: row.total_chunks,
+        exp: row.expires_at_ms
+      });
+    }
+    if (path === "/internal/tmp/ack" && request.method === "POST") {
+      const { transferID, groupHash, deviceID, ackGraceMinutes } = await request.json();
+      const row = this.ctx.storage.sql.exec("SELECT * FROM tmp_transfers WHERE transfer_id = ?", transferID).toArray()[0];
+      if (!row || groupHash && row.group_hash !== groupHash) {
+        return jsonResponse({ ok: true, deleted: true });
+      }
+      const acked = new Set(JSON.parse(row.acked_devices_json || "[]"));
+      if (deviceID) acked.add(deviceID);
+      if (ackGraceMinutes === 0) {
+        await this.deletePhysicalTmpRow(row);
+        return jsonResponse({ ok: true, deleted: true, expiresAtMs: 0 });
+      }
+      let nextExp = row.expires_at_ms;
+      if (ackGraceMinutes > 0) {
+        nextExp = Math.min(nextExp, Date.now() + ackGraceMinutes * 60 * 1e3);
+      }
+      this.ctx.storage.sql.exec(
+        "UPDATE tmp_transfers SET acked_devices_json = ?, expires_at_ms = ? WHERE transfer_id = ?",
+        JSON.stringify(Array.from(acked)),
+        nextExp,
+        transferID
+      );
+      return jsonResponse({ ok: true, deleted: false, expiresAtMs: nextExp });
+    }
+    if (path.startsWith("/internal/tmp/") && request.method === "DELETE") {
+      const transferID = path.slice("/internal/tmp/".length);
+      const groupHash = (url.searchParams.get("group") || "").trim();
+      const row = this.ctx.storage.sql.exec("SELECT * FROM tmp_transfers WHERE transfer_id = ?", transferID).toArray()[0];
+      let deleted = false;
+      if (row && (!groupHash || row.group_hash === groupHash)) {
+        await this.deletePhysicalTmpRow(row);
+        deleted = true;
+      }
+      return jsonResponse({ ok: true, deleted });
+    }
+    if (path === "/v1/updates/check" && request.method === "GET") {
       const platform = (url.searchParams.get("platform") || "macos").toLowerCase();
       const arch = (url.searchParams.get("arch") || "arm64").toLowerCase();
       const channel = (url.searchParams.get("channel") || "stable").toLowerCase();
@@ -1904,7 +3407,7 @@ var MetaStoreDO = class extends DurableObject {
         publishedAtMs: match.publishedAtMs || 0
       });
     }
-    if (url.pathname === "/v1/admin/updates" && (request.method === "POST" || request.method === "PUT")) {
+    if (path === "/v1/admin/updates" && (request.method === "POST" || request.method === "PUT")) {
       let entry;
       try {
         entry = await request.json();
@@ -1921,11 +3424,8 @@ var MetaStoreDO = class extends DurableObject {
       const idx = releases.findIndex(
         (r) => r.platform === entry.platform && r.arch === entry.arch && r.channel === entry.channel
       );
-      if (idx >= 0) {
-        releases[idx] = entry;
-      } else {
-        releases.push(entry);
-      }
+      if (idx >= 0) releases[idx] = entry;
+      else releases.push(entry);
       await this.ctx.storage.put("releases", releases);
       return jsonResponse({ ok: true, release: entry });
     }
@@ -1940,7 +3440,7 @@ function withCORS(request, response) {
   const headers = new Headers(response.headers);
   headers.set("Access-Control-Allow-Origin", origin);
   headers.set("Vary", "Origin");
-  headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type");
+  headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-SyncNow-Ticket, Range");
   headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   return new Response(response.body, {
     status: response.status,
@@ -1991,9 +3491,249 @@ function withQuotaHeaders(request, cfg, bodyText) {
   return new Request(request, { headers });
 }
 __name(withQuotaHeaders, "withQuotaHeaders");
+function expectedPartCipherLen(claims, partIdx) {
+  if (partIdx < 0 || partIdx >= claims.totalChunks) return -1;
+  if (partIdx < claims.totalChunks - 1) return claims.chunkCipher;
+  return claims.totalCipher - (claims.totalChunks - 1) * claims.chunkCipher;
+}
+__name(expectedPartCipherLen, "expectedPartCipherLen");
+async function resolveTmpClaimsForRead(request, env, transferID, groupHash) {
+  const url = new URL(request.url);
+  const rawTicket = (request.headers.get("X-SyncNow-Ticket") || url.searchParams.get("ticket") || "").trim();
+  if (rawTicket) {
+    const verified = await verifyTmpTicket(env, rawTicket, transferID, groupHash || void 0);
+    if (verified) return { claims: verified };
+  }
+  const authRes = await authenticateRequest(request, env);
+  if (!authRes.principal) {
+    return { errorResponse: authRes.errorResponse || apiError(401, "unauthorized", "unauthorized") };
+  }
+  const metaStub = env.META_STORE.get(env.META_STORE.idFromName("global"));
+  const lookupRes = await metaStub.fetch(
+    `https://internal/internal/tmp/lookup/${transferID}?group=${encodeURIComponent(groupHash)}`
+  );
+  if (!lookupRes.ok) {
+    return { errorResponse: lookupRes };
+  }
+  const claims = await lookupRes.json();
+  return { claims };
+}
+__name(resolveTmpClaimsForRead, "resolveTmpClaimsForRead");
+async function handleEdgeTmpRoutes(request, env, url) {
+  const path = url.pathname;
+  const metaStub = env.META_STORE.get(env.META_STORE.idFromName("global"));
+  if (path === "/v1/tmp/init" && request.method === "POST") {
+    const authRes = await authenticateRequest(request, env);
+    if (!authRes.principal) {
+      return authRes.errorResponse || apiError(401, "unauthorized", "unauthorized");
+    }
+    const body = await request.json().catch(() => null);
+    if (!body) return apiError(400, "invalid_json", "invalid json payload");
+    if (!SAFE_ID_REGEX.test(String(body.transferID || "")) || !SAFE_ID_REGEX.test(String(body.groupHash || ""))) {
+      return apiError(400, "invalid_params", "valid transferID and groupHash are required");
+    }
+    return metaStub.fetch("https://internal/internal/tmp/init", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, cfg: authRes.cfg })
+    });
+  }
+  const rest = path.slice("/v1/tmp/".length);
+  const segs = rest.split("/");
+  const transferID = segs[0] || "";
+  if (!SAFE_ID_REGEX.test(transferID)) {
+    return apiError(400, "invalid_transfer_id", "valid transferID is required");
+  }
+  const groupHash = (url.searchParams.get("group") || "").trim();
+  if (segs.length === 1) {
+    if (request.method === "DELETE") {
+      const authRes = await authenticateRequest(request, env);
+      if (!authRes.principal) {
+        return authRes.errorResponse || apiError(401, "unauthorized", "unauthorized");
+      }
+      return metaStub.fetch(
+        `https://internal/internal/tmp/${transferID}?group=${encodeURIComponent(groupHash)}`,
+        { method: "DELETE" }
+      );
+    }
+    if (request.method === "GET") {
+      const { claims, errorResponse } = await resolveTmpClaimsForRead(
+        request,
+        env,
+        transferID,
+        groupHash
+      );
+      if (!claims) return errorResponse;
+      if (claims.backend === "r2" && env.BLOBS) {
+        const rangeHdr = request.headers.get("Range");
+        if (rangeHdr && rangeHdr.startsWith("bytes=")) {
+          const [startStr, endStr] = rangeHdr.slice(6).split("-");
+          const start = Number(startStr || "0");
+          const end = endStr ? Number(endStr) : claims.totalCipher - 1;
+          if (Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end >= start) {
+            const length = Math.min(end, claims.totalCipher - 1) - start + 1;
+            const obj2 = await env.BLOBS.get(claims.r2Key, { range: { offset: start, length } });
+            if (!obj2) return apiError(404, "not_found", "tmp blob not found");
+            return new Response(obj2.body, {
+              status: 206,
+              headers: {
+                "Content-Type": "application/octet-stream",
+                "Content-Length": String(length),
+                "Content-Range": `bytes ${start}-${start + length - 1}/${claims.totalCipher}`,
+                "Accept-Ranges": "bytes"
+              }
+            });
+          }
+        }
+        const obj = await env.BLOBS.get(claims.r2Key);
+        if (!obj) return apiError(404, "not_found", "tmp blob not found");
+        return new Response(obj.body, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": String(obj.size),
+            "Accept-Ranges": "bytes"
+          }
+        });
+      }
+      const groupStub = env.RELAY_GROUP.get(env.RELAY_GROUP.idFromName(claims.grp));
+      return groupStub.fetch(
+        `https://internal/internal/do-tmp/${transferID}?totalChunks=${claims.totalChunks}&totalCipher=${claims.totalCipher}`
+      );
+    }
+    return apiError(405, "method_not_allowed", "method not allowed");
+  }
+  if (segs.length === 2 && segs[1] === "complete" && request.method === "POST") {
+    const authRes = await authenticateRequest(request, env);
+    if (!authRes.principal) {
+      return authRes.errorResponse || apiError(401, "unauthorized", "unauthorized");
+    }
+    const body = await request.json().catch(() => ({}));
+    return metaStub.fetch("https://internal/internal/tmp/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, transferID })
+    });
+  }
+  if (segs.length === 2 && segs[1] === "ack" && request.method === "POST") {
+    const authRes = await authenticateRequest(request, env);
+    if (!authRes.principal) {
+      return authRes.errorResponse || apiError(401, "unauthorized", "unauthorized");
+    }
+    const body = await request.json().catch(() => ({}));
+    return metaStub.fetch("https://internal/internal/tmp/ack", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...body,
+        transferID,
+        ackGraceMinutes: authRes.cfg.tmpAckGraceMinutes
+      })
+    });
+  }
+  if (segs.length === 3 && segs[1] === "parts") {
+    const partIdx = Number(segs[2]);
+    if (!Number.isInteger(partIdx) || partIdx < 0 || partIdx >= MAX_TMP_CHUNKS_PER_TRANSFER) {
+      return apiError(400, "invalid_part", "invalid part index");
+    }
+    if (request.method === "PUT" || request.method === "POST") {
+      const rawTicket = (request.headers.get("X-SyncNow-Ticket") || url.searchParams.get("ticket") || "").trim();
+      let claims = rawTicket ? await verifyTmpTicket(env, rawTicket, transferID, groupHash || void 0) : null;
+      if (!claims) {
+        return apiError(401, "invalid_ticket", "valid X-SyncNow-Ticket is required for part upload");
+      }
+      const wantLen = expectedPartCipherLen(claims, partIdx);
+      if (wantLen <= 0) {
+        return apiError(400, "invalid_part", "part index out of range");
+      }
+      const clHeader = request.headers.get("Content-Length");
+      if (clHeader && Number(clHeader) !== wantLen) {
+        return apiError(
+          400,
+          "part_size_mismatch",
+          `expected ${wantLen} bytes, got ${clHeader}`
+        );
+      }
+      if (claims.backend === "r2" && env.BLOBS) {
+        if (!request.body) return apiError(400, "empty_body", "empty upload body");
+        let etag = "";
+        if (claims.totalChunks === 1) {
+          const data = new Uint8Array(await request.arrayBuffer());
+          if (data.byteLength !== wantLen) {
+            return apiError(
+              400,
+              "part_size_mismatch",
+              `expected ${wantLen} bytes, got ${data.byteLength}`
+            );
+          }
+          const obj = await env.BLOBS.put(claims.r2Key, data, {
+            httpMetadata: { contentType: "application/octet-stream" }
+          });
+          etag = obj.etag;
+        } else {
+          if (!claims.uploadId) {
+            return apiError(400, "missing_upload_id", "missing R2 multipart uploadId");
+          }
+          const mpu = env.BLOBS.resumeMultipartUpload(claims.r2Key, claims.uploadId);
+          const uploaded = await mpu.uploadPart(partIdx + 1, request.body);
+          etag = uploaded.etag;
+        }
+        await metaStub.fetch("https://internal/internal/tmp/record-part", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ transferID, partIndex: partIdx, etag })
+        });
+        return jsonResponse({ partIndex: partIdx, partNumber: partIdx + 1, etag });
+      }
+      const groupStub = env.RELAY_GROUP.get(env.RELAY_GROUP.idFromName(claims.grp));
+      const doRes = await groupStub.fetch(
+        `https://internal/internal/do-tmp/${transferID}/parts/${partIdx}?expectedLen=${wantLen}`,
+        { method: "PUT", body: request.body }
+      );
+      if (!doRes.ok) return doRes;
+      const partData = await doRes.json();
+      await metaStub.fetch("https://internal/internal/tmp/record-part", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transferID, partIndex: partIdx, etag: partData.etag })
+      });
+      return jsonResponse(partData);
+    }
+    if (request.method === "GET") {
+      const { claims, errorResponse } = await resolveTmpClaimsForRead(
+        request,
+        env,
+        transferID,
+        groupHash
+      );
+      if (!claims) return errorResponse;
+      const partLen = expectedPartCipherLen(claims, partIdx);
+      if (partLen <= 0) return apiError(400, "invalid_part", "part index out of range");
+      if (claims.backend === "r2" && env.BLOBS) {
+        const offset = partIdx * claims.chunkCipher;
+        const obj = await env.BLOBS.get(claims.r2Key, { range: { offset, length: partLen } });
+        if (!obj) return apiError(404, "not_found", "tmp part not found");
+        return new Response(obj.body, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": String(partLen)
+          }
+        });
+      }
+      const groupStub = env.RELAY_GROUP.get(env.RELAY_GROUP.idFromName(claims.grp));
+      return groupStub.fetch(`https://internal/internal/do-tmp/${transferID}/parts/${partIdx}`);
+    }
+  }
+  return apiError(404, "not_found", "Not found");
+}
+__name(handleEdgeTmpRoutes, "handleEdgeTmpRoutes");
 async function handleRequest(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
+  if (path === "/ping" && request.method === "GET") {
+    return jsonResponse({ ok: true });
+  }
   if (path === "/favicon.ico" && request.method === "GET") {
     return new Response(null, {
       status: 204,
@@ -2069,10 +3809,12 @@ async function handleRequest(request, env) {
   }
   if (path === "/v1/setup/status" && request.method === "GET") {
     const cfg2 = await loadRuntimeConfig(env, true);
+    const storageBackend = env.BLOBS ? "r2" : "do_sqlite";
     if (!cfg2.initialized) {
       return jsonResponse({
         initialized: false,
         runtime: "cloudflare-workers",
+        storageBackend,
         version: RELAY_VERSION,
         siteName: cfg2.siteName,
         authMode: cfg2.authMode,
@@ -2080,6 +3822,10 @@ async function handleRequest(request, env) {
         maxEnvelopes: cfg2.maxEnvelopes,
         maxBlobMB: cfg2.maxBlobMB,
         blobTTLDays: cfg2.blobTTLDays,
+        maxTmpFileMB: cfg2.maxTmpFileMB,
+        maxTmpTotalMB: cfg2.maxTmpTotalMB,
+        tmpTTLHours: cfg2.tmpTTLHours,
+        tmpAckGraceMinutes: cfg2.tmpAckGraceMinutes,
         r2Enabled: Boolean(env.BLOBS),
         isAdmin: false
       });
@@ -2102,9 +3848,17 @@ async function handleRequest(request, env) {
         }
       );
     }
+    const metaStub = env.META_STORE.get(env.META_STORE.idFromName("global"));
+    const summaryRes = await metaStub.fetch("https://internal/internal/admin-summary", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cfg2)
+    });
+    const summary = await summaryRes.json();
     return jsonResponse({
       initialized: true,
       runtime: "cloudflare-workers",
+      storageBackend,
       version: RELAY_VERSION,
       siteName: cfg2.siteName,
       authMode: cfg2.authMode,
@@ -2117,6 +3871,12 @@ async function handleRequest(request, env) {
       maxEnvelopes: cfg2.maxEnvelopes,
       maxBlobMB: cfg2.maxBlobMB,
       blobTTLDays: cfg2.blobTTLDays,
+      maxTmpFileMB: cfg2.maxTmpFileMB,
+      maxTmpTotalMB: cfg2.maxTmpTotalMB,
+      tmpTTLHours: cfg2.tmpTTLHours,
+      tmpAckGraceMinutes: cfg2.tmpAckGraceMinutes,
+      tmpStats: summary.tmpStats,
+      deviceTokens: summary.deviceTokens,
       r2Enabled: Boolean(env.BLOBS),
       isAdmin: true
     });
@@ -2207,6 +3967,9 @@ async function handleRequest(request, env) {
     if (mode !== "xtags_owner" && mode !== "xtags_multi" && mode !== "static_token") {
       return apiError(400, "invalid_mode", "authMode must be xtags_owner, xtags_multi, or static_token");
     }
+    const maxTmpFileCup = env.BLOBS ? 102400 : 512;
+    const maxTmpFileMB = req.maxTmpFileMB && req.maxTmpFileMB >= 1 && req.maxTmpFileMB <= maxTmpFileCup ? req.maxTmpFileMB : cfg2.maxTmpFileMB;
+    const rawTmpTotalMB = req.maxTmpTotalMB && req.maxTmpTotalMB >= 1 && req.maxTmpTotalMB <= 1024e3 ? req.maxTmpTotalMB : cfg2.maxTmpTotalMB;
     const next = {
       ...cfg2,
       initialized: true,
@@ -2215,6 +3978,10 @@ async function handleRequest(request, env) {
       maxEnvelopes: req.maxEnvelopes && req.maxEnvelopes > 0 && req.maxEnvelopes <= 5e3 ? req.maxEnvelopes : cfg2.maxEnvelopes,
       maxBlobMB: req.maxBlobMB && req.maxBlobMB > 0 && req.maxBlobMB <= 512 ? req.maxBlobMB : cfg2.maxBlobMB,
       blobTTLDays: req.blobTTLDays && req.blobTTLDays > 0 && req.blobTTLDays <= 365 ? req.blobTTLDays : cfg2.blobTTLDays,
+      maxTmpFileMB,
+      maxTmpTotalMB: Math.max(maxTmpFileMB, rawTmpTotalMB),
+      tmpTTLHours: req.tmpTTLHours && req.tmpTTLHours >= 1 && req.tmpTTLHours <= 720 ? req.tmpTTLHours : cfg2.tmpTTLHours,
+      tmpAckGraceMinutes: req.tmpAckGraceMinutes !== void 0 && Number.isFinite(req.tmpAckGraceMinutes) && req.tmpAckGraceMinutes >= -1 && req.tmpAckGraceMinutes <= 10080 ? req.tmpAckGraceMinutes : cfg2.tmpAckGraceMinutes,
       updatedAtMs: Date.now()
     };
     if (req.adminToken && req.adminToken.trim()) {
@@ -2263,6 +4030,64 @@ async function handleRequest(request, env) {
     invalidateConfigCache();
     return jsonResponse({ ok: true });
   }
+  if (path === "/v1/setup/tmp-policy" && request.method === "POST") {
+    const cfg2 = await loadRuntimeConfig(env, true);
+    if (!await isSetupAdmin(request, cfg2)) {
+      return apiError(401, "unauthorized", "admin authentication required");
+    }
+    const req = await request.json().catch(() => null);
+    if (!req) return apiError(400, "invalid_json", "invalid json payload");
+    const maxTmpFileCap = env.BLOBS ? 102400 : 512;
+    const next = { ...cfg2, updatedAtMs: Date.now() };
+    if (req.maxEnvelopes && req.maxEnvelopes >= 10 && req.maxEnvelopes <= 5e3) {
+      next.maxEnvelopes = req.maxEnvelopes;
+    }
+    if (req.maxBlobMB && req.maxBlobMB >= 1 && req.maxBlobMB <= 512) {
+      next.maxBlobMB = req.maxBlobMB;
+    }
+    if (req.blobTTLDays && req.blobTTLDays >= 1 && req.blobTTLDays <= 365) {
+      next.blobTTLDays = req.blobTTLDays;
+    }
+    if (req.maxTmpFileMB && req.maxTmpFileMB >= 1 && req.maxTmpFileMB <= maxTmpFileCap) {
+      next.maxTmpFileMB = req.maxTmpFileMB;
+    }
+    if (req.maxTmpTotalMB && req.maxTmpTotalMB >= 1 && req.maxTmpTotalMB <= 1024e3) {
+      next.maxTmpTotalMB = req.maxTmpTotalMB;
+    }
+    if (req.tmpTTLHours && req.tmpTTLHours >= 1 && req.tmpTTLHours <= 720) {
+      next.tmpTTLHours = req.tmpTTLHours;
+    }
+    if (req.tmpAckGraceMinutes !== void 0 && Number.isFinite(req.tmpAckGraceMinutes) && req.tmpAckGraceMinutes >= -1 && req.tmpAckGraceMinutes <= 10080) {
+      next.tmpAckGraceMinutes = req.tmpAckGraceMinutes;
+    }
+    next.maxTmpTotalMB = Math.max(next.maxTmpFileMB, next.maxTmpTotalMB);
+    const metaStub = env.META_STORE.get(env.META_STORE.idFromName("global"));
+    await metaStub.fetch("https://internal/internal/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(next)
+    });
+    invalidateConfigCache();
+    const summaryRes = await metaStub.fetch("https://internal/internal/admin-summary", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(next)
+    });
+    const summary = await summaryRes.json();
+    return jsonResponse({ ok: true, tmpStats: summary.tmpStats });
+  }
+  if (path === "/v1/setup/purge-tmp" && request.method === "POST") {
+    const cfg2 = await loadRuntimeConfig(env, true);
+    if (!await isSetupAdmin(request, cfg2)) {
+      return apiError(401, "unauthorized", "admin authentication required");
+    }
+    const metaStub = env.META_STORE.get(env.META_STORE.idFromName("global"));
+    return metaStub.fetch("https://internal/internal/purge-tmp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cfg2)
+    });
+  }
   if (path === "/v1/setup/reset" && request.method === "POST") {
     const cfg2 = await loadRuntimeConfig(env, true);
     if (!await isSetupAdmin(request, cfg2)) {
@@ -2271,7 +4096,57 @@ async function handleRequest(request, env) {
     const metaStub = env.META_STORE.get(env.META_STORE.idFromName("global"));
     await metaStub.fetch("https://internal/internal/config", { method: "DELETE" });
     invalidateConfigCache();
+    invalidateDeviceTokenCache();
     return jsonResponse({ ok: true });
+  }
+  if (path === "/v1/auth/device-tokens" || path.startsWith("/v1/auth/device-tokens/")) {
+    const cfg2 = await loadRuntimeConfig(env);
+    const metaStub = env.META_STORE.get(env.META_STORE.idFromName("global"));
+    if (path.startsWith("/v1/auth/device-tokens/")) {
+      if (request.method !== "DELETE") return apiError(405, "method_not_allowed", "method not allowed");
+      if (!await isSetupAdmin(request, cfg2)) {
+        return apiError(401, "unauthorized", "admin authentication required");
+      }
+      const id = path.slice("/v1/auth/device-tokens/".length);
+      if (!SAFE_ID_REGEX.test(id)) return apiError(400, "invalid_id", "invalid token id");
+      const res = await metaStub.fetch(`https://internal/internal/device-tokens/${id}`, {
+        method: "DELETE"
+      });
+      invalidateDeviceTokenCache();
+      return res;
+    }
+    if (request.method === "GET") {
+      if (!await isSetupAdmin(request, cfg2)) {
+        return apiError(401, "unauthorized", "admin authentication required");
+      }
+      return metaStub.fetch("https://internal/internal/device-tokens");
+    }
+    if (request.method === "POST") {
+      let roomID = "";
+      if (await isSetupAdmin(request, cfg2)) {
+        roomID = cfg2.ownerUserID || "static-owner";
+      } else {
+        const authRes2 = await authenticateRequest(request, env);
+        if (!authRes2.principal) {
+          return authRes2.errorResponse || apiError(401, "unauthorized", "unauthorized");
+        }
+        if (authRes2.principal.mode === "device_token" || authRes2.principal.mode === "open") {
+          return apiError(403, "forbidden", "scoped device tokens cannot mint new tokens");
+        }
+        roomID = authRes2.principal.roomID;
+      }
+      const reqBody = await request.json().catch(() => ({}));
+      return metaStub.fetch("https://internal/internal/device-tokens/issue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          label: reqBody.label,
+          ttlDays: reqBody.ttlDays,
+          roomID
+        })
+      });
+    }
+    return apiError(405, "method_not_allowed", "method not allowed");
   }
   if (path === "/health") {
     const authRes2 = await authenticateRequest(request, env);
@@ -2291,21 +4166,41 @@ async function handleRequest(request, env) {
     }
     const authAPI = cfg2.authMode === "static_token" ? "" : (cfg2.authAPI || "").trim();
     const userSummary = principal2.user ? { id: principal2.user.id, displayName: principal2.user.displayName } : void 0;
-    const capabilities = ["e2ee_relay", "e2ee_blobs", "same_account_signaling", "updates", "web_setup"];
+    const capabilities = [
+      "e2ee_relay",
+      "e2ee_blobs",
+      "tmp_chunked_blobs",
+      "same_account_signaling",
+      "group_key_vault",
+      "ws_peer_tunnel",
+      "device_tokens",
+      "web_setup"
+    ];
     if (authAPI) capabilities.push("xtags_auth");
     if (env.BLOBS) capabilities.push("r2_blobs");
     return jsonResponse({
       status: "ok",
       service: "syncnow-relay",
       runtime: "cloudflare-workers",
+      storageBackend: env.BLOBS ? "r2" : "do_sqlite",
       version: RELAY_VERSION,
       initialized: cfg2.initialized,
       xtagsAuth: Boolean(authAPI),
       ownerLocked: cfg2.authMode === "xtags_owner" && cfg2.allowUsers.length > 0,
       authenticated: principal2.mode !== "open",
+      authMode: principal2.mode,
+      maxBlobMB: cfg2.maxBlobMB,
+      maxTmpFileMB: cfg2.maxTmpFileMB,
+      maxTmpTotalMB: cfg2.maxTmpTotalMB,
+      tmpTTLHours: cfg2.tmpTTLHours,
+      tmpAckGraceMinutes: cfg2.tmpAckGraceMinutes,
+      tmpChunkPlainBytes: DEFAULT_TMP_CHUNK_PLAIN_BYTES,
       user: userSummary,
       capabilities
     });
+  }
+  if (path.startsWith("/v1/tmp/")) {
+    return handleEdgeTmpRoutes(request, env, url);
   }
   if (path === "/v1/updates/check") {
     const metaStub = env.META_STORE.get(env.META_STORE.idFromName("global"));
@@ -2339,7 +4234,7 @@ async function handleRequest(request, env) {
   if (!principal) {
     return authRes.errorResponse || apiError(401, "unauthorized", "unauthorized");
   }
-  if (path === "/v1/signal/ws" || path === "/v1/signal/peers") {
+  if (path === "/v1/signal/ws" || path === "/v1/signal/peers" || path === "/v1/signal/group-vault" || path === "/v1/tunnel/ws") {
     const roomStub = env.SIGNALING_ROOM.get(env.SIGNALING_ROOM.idFromName(principal.roomID));
     const fwdHeaders = new Headers(request.headers);
     fwdHeaders.set("X-SyncNow-Room-ID", principal.roomID);
@@ -2378,3 +4273,4 @@ export {
   SignalingRoomDO,
   index_default as default
 };
+//# sourceMappingURL=index.js.map

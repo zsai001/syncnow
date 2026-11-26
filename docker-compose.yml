@@ -11,17 +11,23 @@ services:
     environment:
       SYNCNOW_RELAY_ADDR: ":8787"
       SYNCNOW_RELAY_DATA: "/data"
+      SYNCNOW_RUNTIME: "docker"
       # Unified xtags.top auth API (leave empty ONLY if you want static --token airgapped mode)
       SYNCNOW_AUTH_API: "${SYNCNOW_AUTH_API:-https://api.xtags.top}"
       # Optional: comma-separated xtags user IDs to strictly lock this relay to your own account(s)
       SYNCNOW_ALLOW_USERS: "${SYNCNOW_ALLOW_USERS:-}"
       # Optional: static bearer token for offline/airgapped mode (no xtags.top required)
       SYNCNOW_RELAY_TOKEN: "${SYNCNOW_RELAY_TOKEN:-}"
-      # Optional: admin token for publishing /v1/admin/updates
+      # Optional: admin token override
       SYNCNOW_ADMIN_TOKEN: "${SYNCNOW_ADMIN_TOKEN:-}"
       SYNCNOW_MAX_ENVELOPES: "${SYNCNOW_MAX_ENVELOPES:-500}"
       SYNCNOW_MAX_BLOB_MB: "${SYNCNOW_MAX_BLOB_MB:-25}"
       SYNCNOW_BLOB_TTL_DAYS: "${SYNCNOW_BLOB_TTL_DAYS:-7}"
+      # Streaming E2EE Tmp Large File Relay defaults (all dynamically adjustable in /setup UI!)
+      SYNCNOW_MAX_TMP_FILE_MB: "${SYNCNOW_MAX_TMP_FILE_MB:-1024}"
+      SYNCNOW_MAX_TMP_TOTAL_MB: "${SYNCNOW_MAX_TMP_TOTAL_MB:-8192}"
+      SYNCNOW_TMP_TTL_HOURS: "${SYNCNOW_TMP_TTL_HOURS:-12}"
+      SYNCNOW_TMP_ACK_GRACE_MINUTES: "${SYNCNOW_TMP_ACK_GRACE_MINUTES:-30}"
     volumes:
       - relay_data:/data
     security_opt:

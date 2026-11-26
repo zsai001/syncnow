@@ -1,6 +1,6 @@
 {
   "name": "syncnow-relay",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "Self-hosted SyncNow E2EE Clipboard, File Blob & Same-Account Signaling Relay (Cloudflare Workers, Docker & VPS)",

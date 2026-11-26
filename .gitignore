@@ -2,6 +2,7 @@ syncnow-relay
 /dist/
 data/
 .env
+package-lock.json
 node_modules/
 .wrangler/
 .wrangler-dry-run/

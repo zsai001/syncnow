@@ -18,10 +18,11 @@
 
 ## 核心特性 / Features
 
-- **开箱自带网页初始化向导（Web Setup UI）**：无论是 Cloudflare Workers、Docker 还是 Linux VPS，安装全程零交互不卡死；部署完打开浏览器访问 `https://你的域名/`（或 `/setup`）即可 30 秒绑定机主 `xtags.top` 账号、设置访问白名单与配额，无需手动改环境变量。
-- **零明文端到端加密（E2EE）**：剪贴板内容（`/ws`、`/v1/sync`、`/v1/push`）与文件/图片附件（`/v1/blobs/`）均在客户端使用 `ChaCha20-Poly1305` 加密后上传，中继服务端永不可见明文。
-- **统一 `xtags.top` 账号鉴权**：默认直接校验客户端的 `xtags.top` Bearer Token（带内存 TTL 缓存），无需在自建中继上重复维护账号密码库。
-- **同账号信令互通（Zero-Pairing Signaling）**：`/v1/signal/ws` 与 `/v1/signal/peers` 按校验后的 `xtags.top` `userId` 严格隔离房间，跨网段 / ZeroTier / Tailscale / 公网自动匹配同账号设备端点，直连后免配对直接控制。
+- **开箱自带网页初始化向导与管理控制台（Web Setup UI）**：无论是 Cloudflare Workers、Docker 还是 Linux VPS，安装全程零交互不卡死；部署完打开浏览器访问 `https://你的域名/`（或 `/setup`）即可 30 秒绑定机主 `xtags.top` 账号、在线调整 **Tmp 大文件体积上限与保留期限**、查看宿主机磁盘余量、一键清空临时缓存，并签发移动端受限设备令牌（`snr_dev_...`）。
+- **流式分块 `tmp` 大文件临时中转（8MiB/片 E2EE）**：利用 Cloudflare R2 Multipart 边缘直传（零出口流量费，默认 8GB 水位严守 10GB 免费层；未开 R2 时自动回退 DO SQLite 流式分块）或 Docker/VPS 本地磁盘，支持断点续传、HTTP Range、签收后自动延迟清理与 LRU 防爆仓。
+- **零明文端到端加密（E2EE）**：剪贴板内容（`/ws`、`/v1/sync`、`/v1/push`）、小附件（`/v1/blobs/`）与大文件分片（`/v1/tmp/*`）均在客户端使用 `ChaCha20-Poly1305` 加密后上传，中继服务端永不可见明文。
+- **统一 `xtags.top` 账号鉴权 & 同账号组密钥自动收敛**：默认校验 `xtags.top` Bearer Token，并通过 `/v1/signal/group-vault` 使用设备 `SyncNowAccountCert` + `X25519` 零知识自动对齐异地同账号设备的 `SNK-` 组密钥。
+- **同账号信令互通与跨 NAT WebSocket 隧道兜底（`/v1/tunnel/ws`）**：直连可达时自动建立 P2P 控制；家宽/热点对称 NAT 无法直连时自动无缝回退至零明文二进制 WebSocket 隧道，解锁异地免配对直连与跨屏键鼠协同。
 - **机主独占锁**：网页 Setup 一键绑定你的 `xtags.top` 账号，仅允许你自己（或白名单账号）使用，其他账号自动 `403` 拦截。
 - **离线/纯内网静态令牌模式**：也支持完全不连 `xtags.top` 的静态 Bearer Token 私有部署。
 

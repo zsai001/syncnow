@@ -89,10 +89,26 @@
     .mode-card .title { font-size: 13.5px; font-weight: 700; margin-bottom: 4px; }
     .mode-card .desc { font-size: 11.5px; color: var(--muted); line-height: 1.4; }
     label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 12px 0 6px; }
-    input[type="text"], input[type="password"], input[type="number"], textarea {
+    input[type="text"], input[type="password"], input[type="number"], select, textarea {
       width: 100%; padding: 10px 12px; border-radius: 10px;
       border: 1px solid var(--border); background: var(--card-2); color: var(--text);
       font-size: 13.5px; outline: none; font-family: inherit;
+    }
+    .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+    .chip {
+      padding: 4px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600;
+      border: 1px solid var(--border); background: var(--card-2); color: var(--muted);
+      cursor: pointer;
+    }
+    .chip:hover { border-color: var(--accent); color: var(--text); }
+    .bar-track {
+      width: 100%; height: 8px; border-radius: 999px; background: rgba(148, 163, 184, 0.18);
+      overflow: hidden; margin-top: 8px;
+    }
+    .bar-fill {
+      height: 100%; border-radius: 999px;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+      transition: width 0.25s ease;
     }
     input.mono, textarea.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     input:focus, textarea:focus { border-color: var(--accent); }
@@ -209,8 +225,58 @@
         </div>
       </div>
 
+      <!-- Tmp Large File Storage & Expiration Policy -->
+      <div style="margin-top:16px; padding:14px; border-radius:13px; border:1px solid var(--border); background:var(--card-2);">
+        <div style="font-size:13px; font-weight:700; margin-bottom:2px;" data-i18n="tmpSectionTitle">3. 临时大文件中转 (Tmp) 大小与保留期限</div>
+        <div style="font-size:12px; color:var(--muted); margin-bottom:10px;" id="setupTmpBackendHint">分块流式端到端加密中转（8MiB/片），到期或签收后自动清理释放空间。</div>
+        <div class="grid-2">
+          <div>
+            <label data-i18n="maxTmpFileLabel">单文件大小上限 (MB)</label>
+            <input type="number" id="setupMaxTmpFileMB" value="1024" min="1" max="102400" />
+            <div class="chips">
+              <button type="button" class="chip" data-set-input="setupMaxTmpFileMB" data-val="128">128 MB</button>
+              <button type="button" class="chip" data-set-input="setupMaxTmpFileMB" data-val="512">512 MB</button>
+              <button type="button" class="chip" data-set-input="setupMaxTmpFileMB" data-val="1024">1 GB</button>
+              <button type="button" class="chip" data-set-input="setupMaxTmpFileMB" data-val="2048">2 GB</button>
+              <button type="button" class="chip" data-set-input="setupMaxTmpFileMB" data-val="4096">4 GB</button>
+            </div>
+          </div>
+          <div>
+            <label data-i18n="maxTmpTotalLabel">临时缓存总容量上限 (MB)</label>
+            <input type="number" id="setupMaxTmpTotalMB" value="8192" min="16" max="1024000" />
+            <div class="chips">
+              <button type="button" class="chip" data-set-input="setupMaxTmpTotalMB" data-val="1024">1 GB</button>
+              <button type="button" class="chip" data-set-input="setupMaxTmpTotalMB" data-val="8192">8 GB (R2 免费层推荐)</button>
+              <button type="button" class="chip" data-set-input="setupMaxTmpTotalMB" data-val="20480">20 GB</button>
+              <button type="button" class="chip" data-set-input="setupMaxTmpTotalMB" data-val="51200">50 GB</button>
+            </div>
+          </div>
+          <div>
+            <label data-i18n="tmpTTLHoursLabel">临时文件保留期限 (小时)</label>
+            <input type="number" id="setupTmpTTLHours" value="12" min="1" max="720" />
+            <div class="chips">
+              <button type="button" class="chip" data-set-input="setupTmpTTLHours" data-val="1">1h</button>
+              <button type="button" class="chip" data-set-input="setupTmpTTLHours" data-val="4">4h</button>
+              <button type="button" class="chip" data-set-input="setupTmpTTLHours" data-val="12">12h</button>
+              <button type="button" class="chip" data-set-input="setupTmpTTLHours" data-val="24">24h (1天)</button>
+              <button type="button" class="chip" data-set-input="setupTmpTTLHours" data-val="72">72h (3天)</button>
+              <button type="button" class="chip" data-set-input="setupTmpTTLHours" data-val="168">7天</button>
+            </div>
+          </div>
+          <div>
+            <label data-i18n="tmpAckGraceLabel">对端接收 (ACK) 后回收策略</label>
+            <select id="setupTmpAckGrace">
+              <option value="30">签收后保留 30 分钟（默认 · 兼顾多端粘贴）</option>
+              <option value="0">签收即焚（下载完成后立即物理删除）</option>
+              <option value="120">签收后保留 2 小时</option>
+              <option value="-1">不提前回收（严格按保留期限到期清理）</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
       <details style="margin-top:14px;">
-        <summary style="cursor:pointer; font-size:12.5px; color:var(--muted); font-weight:600;" data-i18n="advancedOptions">高级参数（中继名称 / 配额 / 自定义 Auth API）</summary>
+        <summary style="cursor:pointer; font-size:12.5px; color:var(--muted); font-weight:600;" data-i18n="advancedOptions">高级参数（中继名称 / 普通剪贴板配额 / 自定义 Auth API）</summary>
         <div class="grid-2" style="margin-top:8px;">
           <div>
             <label data-i18n="siteNameLabel">中继名称</label>
@@ -225,15 +291,15 @@
             <input type="number" id="setupMaxEnvelopes" value="500" min="50" max="5000" />
           </div>
           <div>
-            <label data-i18n="maxBlobLabel">单文件最大体积 (MB)</label>
+            <label data-i18n="maxBlobLabel">普通内联图片/小附件上限 (MB)</label>
             <input type="number" id="setupMaxBlobMB" value="25" min="1" max="512" />
           </div>
           <div>
-            <label data-i18n="blobTTLLabel">加密文件保留天数</label>
+            <label data-i18n="blobTTLLabel">普通剪贴板图片保留天数</label>
             <input type="number" id="setupBlobTTLDays" value="7" min="1" max="365" />
           </div>
           <div>
-            <label data-i18n="adminTokenOptLabel">更新发布 Admin Token（可选）</label>
+            <label data-i18n="adminTokenOptLabel">备用管理令牌 Admin Token（可选）</label>
             <input type="password" id="setupAdminToken" class="mono" placeholder="留空则沿用机主身份或静态令牌" />
           </div>
         </div>
@@ -320,6 +386,126 @@
       <div id="adminAuthMsg" class="notice hidden"></div>
     </div>
 
+    <!-- TMP LARGE FILE STORAGE & EXPIRATION POLICY CARD -->
+    <div id="tmpStorageCard" class="card hidden">
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+        <div>
+          <h2 data-i18n="tmpCardTitle">临时大文件中转 (Tmp) 存储与期限设置</h2>
+          <p class="sub" style="margin-bottom:0;" id="tmpCardSubtitle">8MiB 分块 E2EE 流式中转 · 支持随时在线修改单文件体积上限与自动过期时间</p>
+        </div>
+        <span class="pill accent" id="storageBackendPill">Storage</span>
+      </div>
+
+      <div class="kv-grid" style="margin-top:12px;">
+        <div class="kv">
+          <div class="k" data-i18n="kvTmpUsed">当前临时中转占用</div>
+          <div class="v" id="tmpUsageText">0 MB / 8192 MB</div>
+          <div class="bar-track"><div class="bar-fill" id="tmpUsageBar" style="width:0%;"></div></div>
+        </div>
+        <div class="kv">
+          <div class="k" id="diskOrEngineLabel">存储后端 / 磁盘空间</div>
+          <div class="v" id="diskOrEngineValue">-</div>
+        </div>
+      </div>
+
+      <div id="cfR2GuideNotice" class="notice info hidden" style="margin-top:8px;">
+        当前 Cloudflare Worker 未绑定 R2 桶，已自动运行于免费 DO SQLite 流式分块兜底模式（建议单文件 ≤ 128 MB）。在 Cloudflare 后台免费开通 R2 后重新执行一键部署脚本，即可自动创建并绑定 <code>syncnow-tmp-blobs</code> 解锁 1 GB+ 零流量费大文件中转。
+      </div>
+
+      <details id="dockerVpsProxyDetails" class="hidden" style="margin-top:10px;">
+        <summary style="cursor:pointer; font-size:12px; color:var(--muted); font-weight:600;">Docker / Linux VPS 部署与反向代理 (Nginx / Caddy) 注意事项</summary>
+        <div class="notice" style="margin-top:8px; font-size:12px; color:var(--muted);">
+          • 数据目录（Docker <code>/data</code> 卷或 VPS <code>/var/lib/syncnow-relay</code>）会自动检测宿主机磁盘剩余空间，防止写满系统盘。<br/>
+          • 若前置 Nginx 反代，请确保配置 <code>client_max_body_size 64m;</code>、<code>proxy_buffering off;</code>、<code>proxy_request_buffering off;</code> 并开启 WebSocket <code>Upgrade</code> 头（覆盖 <code>/ws</code>、<code>/v1/signal/ws</code>、<code>/v1/tunnel/ws</code>）。Caddy 使用仓库自带模板即可开箱流式转发。
+        </div>
+      </details>
+
+      <div class="grid-2" style="margin-top:12px;">
+        <div>
+          <label data-i18n="maxTmpFileLabel">单文件大小上限 (MB)</label>
+          <input type="number" id="dashMaxTmpFileMB" value="1024" min="1" max="102400" />
+          <div class="chips">
+            <button type="button" class="chip" data-set-input="dashMaxTmpFileMB" data-val="128">128 MB</button>
+            <button type="button" class="chip" data-set-input="dashMaxTmpFileMB" data-val="512">512 MB</button>
+            <button type="button" class="chip" data-set-input="dashMaxTmpFileMB" data-val="1024">1 GB</button>
+            <button type="button" class="chip" data-set-input="dashMaxTmpFileMB" data-val="2048">2 GB</button>
+            <button type="button" class="chip" data-set-input="dashMaxTmpFileMB" data-val="4096">4 GB</button>
+          </div>
+        </div>
+        <div>
+          <label data-i18n="maxTmpTotalLabel">临时缓存总容量上限 (MB)</label>
+          <input type="number" id="dashMaxTmpTotalMB" value="8192" min="16" max="1024000" />
+          <div class="chips">
+            <button type="button" class="chip" data-set-input="dashMaxTmpTotalMB" data-val="1024">1 GB</button>
+            <button type="button" class="chip" data-set-input="dashMaxTmpTotalMB" data-val="8192">8 GB (R2 免费红线)</button>
+            <button type="button" class="chip" data-set-input="dashMaxTmpTotalMB" data-val="20480">20 GB</button>
+            <button type="button" class="chip" data-set-input="dashMaxTmpTotalMB" data-val="51200">50 GB</button>
+          </div>
+        </div>
+        <div>
+          <label data-i18n="tmpTTLHoursLabel">临时文件保留期限 (小时)</label>
+          <input type="number" id="dashTmpTTLHours" value="12" min="1" max="720" />
+          <div class="chips">
+            <button type="button" class="chip" data-set-input="dashTmpTTLHours" data-val="1">1h</button>
+            <button type="button" class="chip" data-set-input="dashTmpTTLHours" data-val="4">4h</button>
+            <button type="button" class="chip" data-set-input="dashTmpTTLHours" data-val="12">12h</button>
+            <button type="button" class="chip" data-set-input="dashTmpTTLHours" data-val="24">24h</button>
+            <button type="button" class="chip" data-set-input="dashTmpTTLHours" data-val="72">72h</button>
+            <button type="button" class="chip" data-set-input="dashTmpTTLHours" data-val="168">7天</button>
+          </div>
+        </div>
+        <div>
+          <label data-i18n="tmpAckGraceLabel">对端接收 (ACK) 后回收策略</label>
+          <select id="dashTmpAckGrace">
+            <option value="30">签收后保留 30 分钟（默认）</option>
+            <option value="0">签收即焚（0 分钟立即清理）</option>
+            <option value="120">签收后保留 2 小时</option>
+            <option value="-1">不提前回收（仅按保留期限到期）</option>
+          </select>
+        </div>
+      </div>
+
+      <div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap;">
+        <button type="button" class="btn primary sm" id="saveTmpPolicyBtn" data-i18n="saveTmpPolicyBtn">保存大小与期限设置</button>
+        <button type="button" class="btn danger sm" id="purgeTmpBtn" data-i18n="purgeTmpBtn">一键清空临时文件缓存</button>
+      </div>
+      <div id="tmpPolicyNotice" class="notice hidden"></div>
+    </div>
+
+    <!-- SCOPED DEVICE TOKENS FOR MOBILE / MAS ONBOARDING -->
+    <div id="deviceTokensCard" class="card hidden">
+      <h2 data-i18n="devTokTitle">移动端 / 免账号重定向设备接入令牌 (snr_dev_...)</h2>
+      <p class="sub" data-i18n="devTokDesc">签发仅限剪贴板、Tmp 大文件与同账号信令的受限令牌（不可修改管理后台），供 iOS / Android / 鸿蒙 / Mac App Store 版一键导入。</p>
+
+      <div class="grid-2">
+        <div>
+          <label data-i18n="devTokLabelInput">设备备注名称</label>
+          <input type="text" id="newDevTokLabel" placeholder="例如：iPhone 17 Pro / MatePad" />
+        </div>
+        <div>
+          <label data-i18n="devTokGroupKeyOpt">可选：拼接本地 SNK- 组密钥（仅浏览器本地拼入链接，不上传服务器）</label>
+          <input type="text" id="localGroupKeyForURI" class="mono" placeholder="SNK-...（留空则仅生成中继令牌）" />
+        </div>
+      </div>
+      <div style="margin-top:10px;">
+        <button type="button" class="btn sm primary" id="issueDevTokBtn" data-i18n="issueDevTokBtn">签发设备令牌并生成配对 URI</button>
+      </div>
+
+      <div id="issuedTokenBox" class="hidden" style="margin-top:12px;">
+        <label>新签发的受限设备令牌 / 一键导入 URI（仅显示一次，请复制导入）：</label>
+        <div class="row" style="margin-bottom:8px;">
+          <div class="code-box" style="flex:1;" id="issuedRawToken">-</div>
+          <button type="button" class="btn sm" id="copyIssuedTokBtn">复制令牌</button>
+        </div>
+        <div class="row">
+          <div class="code-box" style="flex:1;" id="issuedPairURI">-</div>
+          <button type="button" class="btn sm" id="copyIssuedURIBtn">复制 syncnow:// 导入链接</button>
+        </div>
+      </div>
+
+      <div id="deviceTokensList" style="margin-top:12px; font-size:12.5px; color:var(--muted);">-</div>
+    </div>
+
     <!-- ADMIN ONLINE PEERS & DANGER ZONE -->
     <div id="adminPeersCard" class="card hidden">
       <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
@@ -359,12 +545,26 @@
         allowUsersLabel: '允许使用的 xtags 用户 ID 白名单（逗号分隔，默认仅你本人）',
         staticTokenLabel: '2. 设置静态访问令牌（同时用于管理员登录）',
         genRandomBtn: '随机生成',
-        advancedOptions: '高级参数（中继名称 / 配额 / 自定义 Auth API）',
+        advancedOptions: '高级参数（中继名称 / 普通剪贴板配额 / 自定义 Auth API）',
         siteNameLabel: '中继名称',
         maxEnvLabel: '每组保留剪贴板条数',
-        maxBlobLabel: '单文件最大体积 (MB)',
-        blobTTLLabel: '加密文件保留天数',
-        adminTokenOptLabel: '更新发布 Admin Token（可选）',
+        maxBlobLabel: '普通内联图片/小附件上限 (MB)',
+        blobTTLLabel: '普通剪贴板图片保留天数',
+        adminTokenOptLabel: '备用管理令牌 Admin Token（可选）',
+        tmpSectionTitle: '3. 临时大文件中转 (Tmp) 大小与保留期限',
+        maxTmpFileLabel: '单文件大小上限 (MB)',
+        maxTmpTotalLabel: '临时缓存总容量上限 (MB)',
+        tmpTTLHoursLabel: '临时文件保留期限 (小时)',
+        tmpAckGraceLabel: '对端接收 (ACK) 后回收策略',
+        tmpCardTitle: '临时大文件中转 (Tmp) 存储与期限设置',
+        kvTmpUsed: '当前临时中转占用',
+        saveTmpPolicyBtn: '保存大小与期限设置',
+        purgeTmpBtn: '一键清空临时文件缓存',
+        devTokTitle: '移动端 / 免账号重定向设备接入令牌 (snr_dev_...)',
+        devTokDesc: '签发仅限剪贴板、Tmp 大文件与同账号信令的受限令牌（不可修改管理后台），供 iOS / Android / 鸿蒙 / Mac App Store 版一键导入。',
+        devTokLabelInput: '设备备注名称',
+        devTokGroupKeyOpt: '可选：拼接本地 SNK- 组密钥（仅浏览器本地拼入链接，不上传服务器）',
+        issueDevTokBtn: '签发设备令牌并生成配对 URI',
         completeSetupBtn: '完成初始化并保存配置',
         saveEditBtn: '保存配置更改',
         cancelBtn: '取消',
@@ -411,12 +611,26 @@
         allowUsersLabel: 'Allowed xtags User IDs (comma-separated, defaults to owner)',
         staticTokenLabel: '2. Set Static Access Token (also unlocks Admin Settings)',
         genRandomBtn: 'Generate',
-        advancedOptions: 'Advanced Settings (Site Name / Quotas / Custom Auth API)',
+        advancedOptions: 'Advanced Settings (Site Name / Clipboard Quotas / Auth API)',
         siteNameLabel: 'Relay Name',
         maxEnvLabel: 'Max Retained Envelopes / Group',
-        maxBlobLabel: 'Max Encrypted Blob Size (MB)',
-        blobTTLLabel: 'Encrypted Blob TTL (Days)',
-        adminTokenOptLabel: 'Release Admin Token (Optional)',
+        maxBlobLabel: 'Max Inline Image/Small Blob (MB)',
+        blobTTLLabel: 'Inline Blob TTL (Days)',
+        adminTokenOptLabel: 'Backup Admin Token (Optional)',
+        tmpSectionTitle: '3. Temporary Large-File Relay (Tmp) Size & Expiration',
+        maxTmpFileLabel: 'Max Single Tmp File Size (MB)',
+        maxTmpTotalLabel: 'Max Total Tmp Cache Cap (MB)',
+        tmpTTLHoursLabel: 'Tmp File Retention (Hours)',
+        tmpAckGraceLabel: 'Post-ACK Cleanup Policy',
+        tmpCardTitle: 'Tmp Large-File Relay Storage & Expiration',
+        kvTmpUsed: 'Active Tmp Cache Usage',
+        saveTmpPolicyBtn: 'Save Size & TTL Policy',
+        purgeTmpBtn: 'Purge All Tmp Files',
+        devTokTitle: 'Scoped Device Access Tokens (snr_dev_...)',
+        devTokDesc: 'Issue revocable data-plane tokens for iOS, Android, HarmonyOS & Mac App Store onboarding without web login redirects.',
+        devTokLabelInput: 'Device Label',
+        devTokGroupKeyOpt: 'Optional: Local SNK- Group Key (combined client-side only)',
+        issueDevTokBtn: 'Issue Device Token & Pairing URI',
         completeSetupBtn: 'Finish Setup & Save',
         saveEditBtn: 'Save Configuration',
         cancelBtn: 'Cancel',
@@ -514,6 +728,110 @@
       renderStatus();
     }
 
+    function formatBytesHuman(bytes) {
+      const b = Number(bytes || 0);
+      if (b <= 0) return '0 MB';
+      const gb = b / (1024 * 1024 * 1024);
+      if (gb >= 1) return gb.toFixed(2) + ' GB';
+      const mb = b / (1024 * 1024);
+      if (mb >= 0.1) return mb.toFixed(1) + ' MB';
+      return Math.max(1, Math.round(b / 1024)) + ' KB';
+    }
+
+    function runtimeLabelText(s) {
+      if (s.runtime === 'cloudflare-workers') return 'Cloudflare Workers';
+      if (s.runtime === 'docker') return 'Docker Container';
+      if (s.runtime === 'linux-vps') return 'Linux VPS';
+      return 'Go Relay';
+    }
+
+    function renderTmpAndTokens(s) {
+      const showAdminCards = Boolean(s.initialized && s.isAdmin);
+      $('tmpStorageCard').classList.toggle('hidden', !showAdminCards);
+      $('deviceTokensCard').classList.toggle('hidden', !showAdminCards);
+      if (!showAdminCards) return;
+
+      const ts = s.tmpStats || {
+        storageBackend: s.storageBackend || (s.r2Enabled ? 'r2' : 'disk'),
+        activeFiles: 0,
+        uploadingFiles: 0,
+        usedBytes: 0,
+        maxTmpFileMB: s.maxTmpFileMB || 1024,
+        maxTmpTotalMB: s.maxTmpTotalMB || 8192,
+        tmpTTLHours: s.tmpTTLHours || 12,
+        tmpAckGraceMinutes: s.tmpAckGraceMinutes ?? 30,
+      };
+      const backend = ts.storageBackend;
+      if (backend === 'r2') {
+        $('storageBackendPill').textContent = 'Cloudflare R2 · Zero Egress';
+      } else if (backend === 'do_sqlite') {
+        $('storageBackendPill').textContent = 'CF DO SQLite (Free Fallback)';
+      } else if (s.runtime === 'docker') {
+        $('storageBackendPill').textContent = 'Docker Volume (' + (s.dataDir || '/data') + ')';
+      } else {
+        $('storageBackendPill').textContent = 'VPS Disk (' + (s.dataDir || 'local') + ')';
+      }
+
+      const maxBytes = Math.max(1, Number(ts.maxTmpTotalMB || 8192) * 1024 * 1024);
+      const pct = Math.min(100, Math.round((Number(ts.usedBytes || 0) / maxBytes) * 100));
+      $('tmpUsageText').textContent =
+        `${formatBytesHuman(ts.usedBytes)} / ${ts.maxTmpTotalMB} MB · ${ts.activeFiles || 0} 个就绪文件` +
+        (ts.uploadingFiles ? ` (${ts.uploadingFiles} 上传中)` : '');
+      $('tmpUsageBar').style.width = `${pct}%`;
+
+      if (ts.diskUsage && ts.diskUsage.totalBytes > 0) {
+        $('diskOrEngineLabel').textContent = lang === 'zh' ? '宿主机 / 数据卷磁盘剩余' : 'Filesystem Free Space';
+        $('diskOrEngineValue').textContent =
+          `${formatBytesHuman(ts.diskUsage.freeBytes)} 可用 / 共 ${formatBytesHuman(ts.diskUsage.totalBytes)}`;
+      } else {
+        $('diskOrEngineLabel').textContent = lang === 'zh' ? '当前策略摘要' : 'Active Tmp Policy';
+        $('diskOrEngineValue').textContent =
+          `单文件 ≤ ${ts.maxTmpFileMB} MB · 保留 ${ts.tmpTTLHours}h`;
+      }
+
+      $('cfR2GuideNotice').classList.toggle('hidden', !(s.runtime === 'cloudflare-workers' && !s.r2Enabled));
+      $('dockerVpsProxyDetails').classList.toggle('hidden', s.runtime === 'cloudflare-workers');
+
+      $('dashMaxTmpFileMB').value = ts.maxTmpFileMB || s.maxTmpFileMB || 1024;
+      $('dashMaxTmpTotalMB').value = ts.maxTmpTotalMB || s.maxTmpTotalMB || 8192;
+      $('dashTmpTTLHours').value = ts.tmpTTLHours || s.tmpTTLHours || 12;
+      $('dashTmpAckGrace').value = String(ts.tmpAckGraceMinutes ?? s.tmpAckGraceMinutes ?? 30);
+
+      renderDeviceTokensList(s.deviceTokens || []);
+    }
+
+    function renderDeviceTokensList(tokens) {
+      const box = $('deviceTokensList');
+      if (!tokens || tokens.length === 0) {
+        box.textContent = lang === 'zh'
+          ? '尚未签发受限设备令牌（桌面端生成配对二维码或点击上方按钮时会自动创建）'
+          : 'No scoped device tokens issued yet.';
+        return;
+      }
+      box.innerHTML = tokens.map((t) => {
+        const created = t.createdAtMs ? new Date(t.createdAtMs).toLocaleDateString() : '';
+        return `<div class="kv" style="margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; gap:8px;">
+          <div>
+            <div class="v" style="font-size:12.5px;">${escapeHtml(t.label)} <span class="mono" style="color:var(--muted); font-weight:400;">(${escapeHtml(t.tokenPreview)})</span></div>
+            <div class="k" style="text-transform:none;">Room: ${escapeHtml(t.roomID)} · ${escapeHtml(created)}</div>
+          </div>
+          <button type="button" class="btn sm danger" data-revoke-tok="${escapeHtml(t.id)}">${lang === 'zh' ? '吊销' : 'Revoke'}</button>
+        </div>`;
+      }).join('');
+      box.querySelectorAll('[data-revoke-tok]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const id = btn.getAttribute('data-revoke-tok');
+          if (!id) return;
+          btn.disabled = true;
+          await fetch('/v1/auth/device-tokens/' + encodeURIComponent(id), {
+            method: 'DELETE',
+            headers: { Authorization: 'Bearer ' + adminBearer },
+          });
+          await loadStatus();
+        });
+      });
+    }
+
     function renderStatus(opts = {}) {
       const { preserveForm = false } = opts;
       const s = currentStatus;
@@ -528,6 +846,8 @@
         $('runtimePill').textContent = '401 · Auth Required';
         $('setupWizardCard').classList.add('hidden');
         $('overviewCard').classList.add('hidden');
+        $('tmpStorageCard').classList.add('hidden');
+        $('deviceTokensCard').classList.add('hidden');
         $('adminPeersCard').classList.add('hidden');
         $('adminAuthCard').classList.remove('hidden');
         $('adminLoginDesc').textContent = dict.adminLoginDesc;
@@ -537,7 +857,7 @@
       }
 
       $('siteTitle').textContent = s.siteName || 'SyncNow Relay';
-      const baseRuntime = `${s.runtime === 'cloudflare-workers' ? 'Cloudflare Workers' : 'Go Relay'} · v${s.version || '0.3.2'}`;
+      const baseRuntime = `${runtimeLabelText(s)} · v${s.version || '0.4.0'}`;
       $('runtimePill').textContent = relayUpdateInfo?.hasUpdate
         ? `${baseRuntime} · ${lang === 'zh' ? '有新版' : 'Update'} v${relayUpdateInfo.latestVersion}`
         : baseRuntime;
@@ -560,7 +880,11 @@
       $('ownerDisplay').textContent = s.ownerDisplayName
         ? `${s.ownerDisplayName} (${s.ownerUserID || ''})`
         : (s.authMode === 'static_token' ? 'Static Token' : (s.ownerLocked ? `${s.allowUsersCount} allowed` : 'Any valid xtags user'));
-      $('quotaDisplay').textContent = `${s.maxEnvelopes} items · ${s.maxBlobMB}MB/file · ${s.blobTTLDays}d TTL${s.r2Enabled ? ' · R2' : ''}`;
+      const tmpMB = s.maxTmpFileMB || 1024;
+      const tmpHours = s.tmpTTLHours || 12;
+      $('quotaDisplay').textContent = `Tmp ≤ ${tmpMB}MB/文件 (${tmpHours}h) · 总上限 ${s.maxTmpTotalMB || 8192}MB${s.r2Enabled ? ' · R2' : ''}`;
+
+      renderTmpAndTokens(s);
 
       if (!s.initialized) {
         isEditingExisting = false;
@@ -602,6 +926,10 @@
       $('setupMaxEnvelopes').value = s.maxEnvelopes || 500;
       $('setupMaxBlobMB').value = s.maxBlobMB || 25;
       $('setupBlobTTLDays').value = s.blobTTLDays || 7;
+      $('setupMaxTmpFileMB').value = s.maxTmpFileMB || (s.runtime === 'cloudflare-workers' && !s.r2Enabled ? 128 : 1024);
+      $('setupMaxTmpTotalMB').value = s.maxTmpTotalMB || (s.runtime === 'cloudflare-workers' && !s.r2Enabled ? 1024 : 8192);
+      $('setupTmpTTLHours').value = s.tmpTTLHours || (s.runtime === 'cloudflare-workers' && !s.r2Enabled ? 4 : 12);
+      $('setupTmpAckGrace').value = String(s.tmpAckGraceMinutes ?? 30);
       $('setupAllowUsers').value = Array.isArray(s.allowUsers) ? s.allowUsers.join(', ') : '';
       if (s.ownerUserID && !verifiedXTags) {
         const label = s.ownerDisplayName ? `${s.ownerDisplayName} (${s.ownerUserID})` : s.ownerUserID;
@@ -828,6 +1156,10 @@
           maxEnvelopes: Number($('setupMaxEnvelopes').value) || 500,
           maxBlobMB: Number($('setupMaxBlobMB').value) || 25,
           blobTTLDays: Number($('setupBlobTTLDays').value) || 7,
+          maxTmpFileMB: Number($('setupMaxTmpFileMB').value) || 1024,
+          maxTmpTotalMB: Number($('setupMaxTmpTotalMB').value) || 8192,
+          tmpTTLHours: Number($('setupTmpTTLHours').value) || 12,
+          tmpAckGraceMinutes: Number($('setupTmpAckGrace').value),
         };
 
         const headers = { 'Content-Type': 'application/json' };
@@ -1063,6 +1395,114 @@
 
     $('checkRelayUpdateBtn').addEventListener('click', () => void checkRelayUpdate(true));
     $('closeRelayUpdateBtn').addEventListener('click', () => $('relayUpdateBox').classList.add('hidden'));
+
+    document.querySelectorAll('[data-set-input]').forEach((chip) => {
+      chip.addEventListener('click', () => {
+        const targetId = chip.getAttribute('data-set-input');
+        const val = chip.getAttribute('data-val');
+        if (targetId && $(targetId) && val !== null) {
+          $(targetId).value = val;
+        }
+      });
+    });
+
+    $('saveTmpPolicyBtn').addEventListener('click', async () => {
+      $('saveTmpPolicyBtn').disabled = true;
+      $('tmpPolicyNotice').classList.add('hidden');
+      try {
+        const body = {
+          maxTmpFileMB: Number($('dashMaxTmpFileMB').value) || 1024,
+          maxTmpTotalMB: Number($('dashMaxTmpTotalMB').value) || 8192,
+          tmpTTLHours: Number($('dashTmpTTLHours').value) || 12,
+          tmpAckGraceMinutes: Number($('dashTmpAckGrace').value),
+        };
+        const res = await fetch('/v1/setup/tmp-policy', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer ' + adminBearer,
+          },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`);
+        await loadStatus();
+        showNotice($('tmpPolicyNotice'), lang === 'zh' ? '✓ 临时大文件大小上限与保留期限已实时生效！' : '✓ Tmp size & expiration policy updated!', 'ok');
+      } catch (err) {
+        showNotice($('tmpPolicyNotice'), err.message || String(err), 'err');
+      } finally {
+        $('saveTmpPolicyBtn').disabled = false;
+      }
+    });
+
+    $('purgeTmpBtn').addEventListener('click', async () => {
+      if (!confirm(lang === 'zh' ? '确定立即删除此中继上所有暂存的临时大文件并释放空间吗？' : 'Delete all temporary relayed files now?')) return;
+      $('purgeTmpBtn').disabled = true;
+      try {
+        const res = await fetch('/v1/setup/purge-tmp', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + adminBearer },
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`);
+        await loadStatus();
+        showNotice(
+          $('tmpPolicyNotice'),
+          lang === 'zh'
+            ? `✓ 已清空 ${data.purgedCount || 0} 个临时文件，释放 ${formatBytesHuman(data.freedBytes || 0)}`
+            : `✓ Purged ${data.purgedCount || 0} file(s), freed ${formatBytesHuman(data.freedBytes || 0)}`,
+          'ok'
+        );
+      } catch (err) {
+        showNotice($('tmpPolicyNotice'), err.message || String(err), 'err');
+      } finally {
+        $('purgeTmpBtn').disabled = false;
+      }
+    });
+
+    $('issueDevTokBtn').addEventListener('click', async () => {
+      $('issueDevTokBtn').disabled = true;
+      try {
+        const label = $('newDevTokLabel').value.trim() || 'Mobile Device';
+        const res = await fetch('/v1/auth/device-tokens', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer ' + adminBearer,
+          },
+          body: JSON.stringify({ label }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.token) throw new Error(data.message || `HTTP ${res.status}`);
+        $('issuedRawToken').textContent = data.token;
+        const qp = new URLSearchParams();
+        qp.set('v', '1');
+        qp.set('relay', window.location.origin);
+        qp.set('token', data.token);
+        const gk = $('localGroupKeyForURI').value.trim();
+        if (gk) qp.set('key', gk);
+        $('issuedPairURI').textContent = 'syncnow://pair?' + qp.toString();
+        $('issuedTokenBox').classList.remove('hidden');
+        $('newDevTokLabel').value = '';
+        await loadStatus();
+      } catch (err) {
+        showNotice($('overviewNotice'), err.message || String(err), 'err');
+      } finally {
+        $('issueDevTokBtn').disabled = false;
+      }
+    });
+
+    $('copyIssuedTokBtn').addEventListener('click', async () => {
+      await copyTextSafe($('issuedRawToken').textContent);
+      $('copyIssuedTokBtn').textContent = I18N[lang].copied;
+      setTimeout(() => { $('copyIssuedTokBtn').textContent = '复制令牌'; }, 1600);
+    });
+
+    $('copyIssuedURIBtn').addEventListener('click', async () => {
+      await copyTextSafe($('issuedPairURI').textContent);
+      $('copyIssuedURIBtn').textContent = I18N[lang].copied;
+      setTimeout(() => { $('copyIssuedURIBtn').textContent = '复制 syncnow:// 导入链接'; }, 1600);
+    });
 
     $('refreshPeersBtn').addEventListener('click', () => void loadOnlinePeers());
 

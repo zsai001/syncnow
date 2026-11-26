@@ -502,3 +502,27 @@ func TestWebSetupWizardAndOwnerProtection(t *testing.T) {
 		resp.Body.Close()
 	}
 }
+
+func TestRelayWSPingPongAndSameDeviceReconnectReplacement(t *testing.T) {
+	relay := NewRelayServerWithOptions(t.TempDir(), "ws-tok", "", "", 100, 1024*1024, time.Hour)
+	srv := httptest.NewServer(relay.Handler())
+	defer srv.Close()
+
+	// 1. Connect device-a and verify app-level JSON ping -> pong on /ws
+	wsA1 := dialTestWS(t, srv.URL, "/ws?group=grp_ping&device=dev-a", "ws-tok")
+	defer wsA1.close()
+	wsA1.sendJSON(t, map[string]string{"type": "ping"})
+	pong := wsA1.readServerMsg(t)
+	if pong.Type != "pong" {
+		t.Fatalf("expected pong from /ws ping, got %+v", pong)
+	}
+
+	// 2. Reconnect same device-a -> old socket is closed cleanly, new socket stays registered
+	wsA2 := dialTestWS(t, srv.URL, "/ws?group=grp_ping&device=dev-a", "ws-tok")
+	defer wsA2.close()
+	wsA2.sendJSON(t, map[string]string{"type": "ping"})
+	pong2 := wsA2.readServerMsg(t)
+	if pong2.Type != "pong" {
+		t.Fatalf("expected pong from replacement /ws socket, got %+v", pong2)
+	}
+}

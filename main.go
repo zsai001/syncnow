@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-const relayVersion = "0.3.2"
+const relayVersion = "0.4.0"
 
 var safeIDRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,128}$`)
 
@@ -52,7 +52,7 @@ type wsClient struct {
 type authPrincipal struct {
 	RoomID string
 	User   *XTagsUser
-	Mode   string // "xtags", "static_token", "open"
+	Mode   string // "xtags", "device_token", "static_token", "open"
 }
 
 type RelayServer struct {
@@ -63,12 +63,16 @@ type RelayServer struct {
 	maxBlobBytes int64
 	blobTTL      time.Duration
 
-	cfgMu      sync.RWMutex
-	cfg        DynamicRelayConfig
-	xtags      *XTagsAuthVerifier
-	adminXTags *XTagsAuthVerifier
-	signaling  *SignalingHub
-	updates    *UpdateStore
+	cfgMu        sync.RWMutex
+	cfg          DynamicRelayConfig
+	xtags        *XTagsAuthVerifier
+	adminXTags   *XTagsAuthVerifier
+	signaling    *SignalingHub
+	tunnels      *TunnelHub
+	groupVault   *GroupKeyVaultStore
+	tmpBlobs     *TmpBlobStore
+	deviceTokens *DeviceTokenStore
+	updates      *UpdateStore
 
 	mu      sync.RWMutex
 	groups  map[string]*groupState
@@ -96,6 +100,10 @@ func NewRelayServerWithOptions(
 		maxBlobBytes: maxBlobBytes,
 		blobTTL:      blobTTL,
 		signaling:    NewSignalingHub(),
+		tunnels:      NewTunnelHub(),
+		groupVault:   NewGroupKeyVaultStore(dataDir),
+		tmpBlobs:     NewTmpBlobStore(dataDir),
+		deviceTokens: NewDeviceTokenStore(dataDir),
 		updates:      NewUpdateStore(dataDir),
 		groups:       make(map[string]*groupState),
 		clients:      make(map[string]map[*wsClient]struct{}),
@@ -107,6 +115,11 @@ func NewRelayServerWithOptions(
 
 func (s *RelayServer) Handler() http.Handler {
 	mux := http.NewServeMux()
+	// Zero-leak container / systemd liveness probe
+	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
 	// Built-in Web Setup Wizard & Status Dashboard (`/` and `/setup`)
 	mux.HandleFunc("/", s.handleSetupPage)
 	mux.HandleFunc("/setup", s.handleSetupPage)
@@ -116,20 +129,29 @@ func (s *RelayServer) Handler() http.Handler {
 	mux.HandleFunc("/v1/setup/relay-update", s.handleSetupRelayUpdate)
 	mux.HandleFunc("/v1/setup/verify-xtags", s.handleSetupVerifyXTags)
 	mux.HandleFunc("/v1/setup/complete", s.handleSetupComplete)
+	mux.HandleFunc("/v1/setup/tmp-policy", s.handleSetupTmpPolicy)
+	mux.HandleFunc("/v1/setup/purge-tmp", s.handleSetupPurgeTmp)
 	mux.HandleFunc("/v1/setup/reset", s.handleSetupReset)
 
-	// Core E2EE Clipboard & File Blob Relay endpoints (user-hosted data plane)
+	// Scoped Revocable Device Tokens (`snr_dev_...`) for mobile / Mac App Store QR onboarding
+	mux.HandleFunc("/v1/auth/device-tokens", s.handleDeviceTokens)
+	mux.HandleFunc("/v1/auth/device-tokens/", s.handleDeviceTokens)
+
+	// Core E2EE Clipboard, Legacy Blobs & Chunked Streaming Tmp Large Files
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/ws", s.handleWS)
 	mux.HandleFunc("/v1/sync", s.handleSync)
 	mux.HandleFunc("/v1/push", s.handlePush)
 	mux.HandleFunc("/v1/blobs/", s.handleBlobs)
+	mux.HandleFunc("/v1/tmp/", s.handleTmpRoutes)
 
-	// Same-Account Peer Presence & Direct-Connect Signaling endpoints (authenticated by xtags.top)
+	// Same-Account Peer Presence, Zero-Knowledge Group Key Vault & E2EE WebSocket Tunnel
 	mux.HandleFunc("/v1/signal/ws", s.handleSignalWS)
 	mux.HandleFunc("/v1/signal/peers", s.handleSignalPeers)
+	mux.HandleFunc("/v1/signal/group-vault", s.handleSignalGroupVault)
+	mux.HandleFunc("/v1/tunnel/ws", s.handleTunnelWS)
 
-	// Auto-Update & Force-Update endpoints
+	// Auto-Update & Force-Update endpoints (used by release manifests & test harnesses)
 	mux.HandleFunc("/v1/updates/check", s.handleUpdatesCheck)
 	mux.HandleFunc("/v1/updates/files/", s.handleUpdateFiles)
 	mux.HandleFunc("/v1/admin/updates", s.handleAdminUpdates)
@@ -138,7 +160,7 @@ func (s *RelayServer) Handler() http.Handler {
 		if origin := r.Header.Get("Origin"); origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-SyncNow-Ticket, Range")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		}
 		if r.Method == http.MethodOptions {
@@ -151,8 +173,9 @@ func (s *RelayServer) Handler() http.Handler {
 
 // authenticateRequest verifies either:
 // 1. Optional static `--token` (airgapped / private self-host fallback)
-// 2. Unified `xtags.top` Bearer token via `GET <auth-api>/v1/auth/me` (cached, with optional `--allow-user` owner lock)
-// 3. Open mode ONLY if both `--token` and `--auth-api` are explicitly empty.
+// 2. Scoped revocable device token `snr_dev_...` (mobile / QR onboarding)
+// 3. Unified `xtags.top` Bearer token via `GET <auth-api>/v1/auth/me` (cached, with optional `--allow-user` owner lock)
+// 4. Open mode ONLY if both `--token` and `--auth-api` are explicitly empty.
 func (s *RelayServer) authenticateRequest(w http.ResponseWriter, r *http.Request) (*authPrincipal, bool) {
 	got := extractBearerToken(r)
 
@@ -166,7 +189,16 @@ func (s *RelayServer) authenticateRequest(w http.ResponseWriter, r *http.Request
 		return &authPrincipal{RoomID: "static-owner", Mode: "static_token"}, true
 	}
 
-	// 2. Unified xtags.top Bearer token verification
+	// 2. Scoped device token (`snr_dev_...`)
+	if strings.HasPrefix(got, deviceTokenPrefix) {
+		if rec, ok := s.deviceTokens.Verify(got); ok {
+			return &authPrincipal{RoomID: rec.RoomID, Mode: "device_token"}, true
+		}
+		writeAPIError(w, http.StatusUnauthorized, "unauthorized", "invalid or revoked device token")
+		return nil, false
+	}
+
+	// 3. Unified xtags.top Bearer token verification
 	if xtagsVerifier != nil && got != "" {
 		user, status, err := xtagsVerifier.VerifyToken(r.Context(), got)
 		if err != nil {
@@ -180,7 +212,7 @@ func (s *RelayServer) authenticateRequest(w http.ResponseWriter, r *http.Request
 		return &authPrincipal{RoomID: user.ID, User: user, Mode: "xtags"}, true
 	}
 
-	// 3. Explicit open mode (neither static token nor xtags auth API configured)
+	// 4. Explicit open mode (neither static token nor xtags auth API configured)
 	if staticToken == "" && xtagsVerifier == nil {
 		return &authPrincipal{RoomID: "open", Mode: "open"}, true
 	}
@@ -219,9 +251,9 @@ func (s *RelayServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cfg := s.currentConfig()
 	s.cfgMu.RLock()
 	xtagsVerifier := s.xtags
-	initialized := s.cfg.Initialized
 	s.cfgMu.RUnlock()
 
 	var authUser map[string]any
@@ -232,19 +264,37 @@ func (s *RelayServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	caps := []string{"e2ee_relay", "e2ee_blobs", "same_account_signaling", "updates", "web_setup"}
+	caps := []string{
+		"e2ee_relay",
+		"e2ee_blobs",
+		"tmp_chunked_blobs",
+		"same_account_signaling",
+		"group_key_vault",
+		"ws_peer_tunnel",
+		"device_tokens",
+		"web_setup",
+	}
 	if xtagsVerifier != nil {
 		caps = append(caps, "xtags_auth")
 	}
 	resp := map[string]any{
-		"status":        "ok",
-		"service":       "syncnow-relay",
-		"version":       relayVersion,
-		"initialized":   initialized,
-		"xtagsAuth":     xtagsVerifier != nil,
-		"ownerLocked":   xtagsVerifier != nil && xtagsVerifier.HasAllowedUserFilter(),
-		"authenticated": principal.Mode != "open",
-		"capabilities":  caps,
+		"status":             "ok",
+		"service":            "syncnow-relay",
+		"runtime":            detectGoRuntimeName(),
+		"storageBackend":     "disk",
+		"version":            relayVersion,
+		"initialized":        cfg.Initialized,
+		"xtagsAuth":          xtagsVerifier != nil,
+		"ownerLocked":        xtagsVerifier != nil && xtagsVerifier.HasAllowedUserFilter(),
+		"authenticated":      principal.Mode != "open",
+		"authMode":           principal.Mode,
+		"maxBlobMB":          cfg.MaxBlobMB,
+		"maxTmpFileMB":       cfg.MaxTmpFileMB,
+		"maxTmpTotalMB":      cfg.MaxTmpTotalMB,
+		"tmpTTLHours":        cfg.TmpTTLHours,
+		"tmpAckGraceMinutes": cfg.TmpAckGraceMinutes,
+		"tmpChunkPlainBytes": DefaultTmpChunkPlainBytes,
+		"capabilities":       caps,
 	}
 	if authUser != nil {
 		resp["user"] = authUser
@@ -282,6 +332,17 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if op != wsOpText && op != wsOpBinary {
+			continue
+		}
+		var ctrl struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(payload, &ctrl) == nil && ctrl.Type == "ping" {
+			pong, _ := json.Marshal(map[string]any{
+				"type":   "pong",
+				"timeMs": time.Now().UnixMilli(),
+			})
+			_ = ws.WriteText(pong)
 			continue
 		}
 		var env Envelope
@@ -414,11 +475,22 @@ func (s *RelayServer) handleBlobs(w http.ResponseWriter, r *http.Request) {
 
 func (s *RelayServer) registerClient(c *wsClient) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.clients[c.groupHash] == nil {
 		s.clients[c.groupHash] = make(map[*wsClient]struct{})
 	}
+	var stale []*wsClient
+	for existing := range s.clients[c.groupHash] {
+		if existing != c && existing.deviceID == c.deviceID {
+			stale = append(stale, existing)
+			delete(s.clients[c.groupHash], existing)
+		}
+	}
 	s.clients[c.groupHash][c] = struct{}{}
+	s.mu.Unlock()
+
+	for _, old := range stale {
+		_ = old.ws.Close()
+	}
 }
 
 func (s *RelayServer) unregisterClient(c *wsClient) {
@@ -505,7 +577,7 @@ func (s *RelayServer) loadPersistedGroups() {
 }
 
 func (s *RelayServer) StartCleanupLoop(stop <-chan struct{}) {
-	ticker := time.NewTicker(1 * time.Hour)
+	ticker := time.NewTicker(15 * time.Minute)
 	defer ticker.Stop()
 	for {
 		select {
@@ -513,6 +585,7 @@ func (s *RelayServer) StartCleanupLoop(stop <-chan struct{}) {
 			return
 		case <-ticker.C:
 			s.cleanupExpiredBlobs()
+			s.tmpBlobs.CleanupExpired()
 		}
 	}
 }
@@ -574,6 +647,7 @@ func main() {
 		Addr:              *addr,
 		Handler:           relay.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
@@ -616,6 +690,15 @@ func envIntOrDefault(key string, fallback int) int {
 func envInt64OrDefault(key string, fallback int64) int64 {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
+
+func envIntAllowNegOrDefault(key string, fallback int) int {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= -1 {
 			return n
 		}
 	}

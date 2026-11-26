@@ -51,6 +51,10 @@ func upgradeWebSocket(w http.ResponseWriter, r *http.Request) (*wsConn, error) {
 	if err != nil {
 		return nil, err
 	}
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
 
 	sum := sha1.Sum([]byte(key + wsGUID))
 	accept := base64.StdEncoding.EncodeToString(sum[:])
@@ -151,6 +155,10 @@ func (c *wsConn) ReadMessage(maxSize int64) (byte, []byte, error) {
 
 func (c *wsConn) WriteText(payload []byte) error {
 	return c.writeFrame(wsOpText, payload)
+}
+
+func (c *wsConn) WriteBinary(payload []byte) error {
+	return c.writeFrame(wsOpBinary, payload)
 }
 
 func (c *wsConn) WriteControl(opcode byte, payload []byte) error {

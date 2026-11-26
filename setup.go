@@ -20,19 +20,23 @@ var setupUIHTML []byte
 // DynamicRelayConfig holds runtime settings manageable directly via the built-in Web Setup UI (`/` & `/setup`),
 // persisted cleanly to `<dataDir>/config.json` (0600) so Docker/VPS users never have to edit env files manually!
 type DynamicRelayConfig struct {
-	Initialized      bool     `json:"initialized"`
-	SiteName         string   `json:"siteName"`
-	AuthMode         string   `json:"authMode"` // "xtags_owner" | "xtags_multi" | "static_token"
-	AuthAPI          string   `json:"authAPI"`
-	OwnerUserID      string   `json:"ownerUserID,omitempty"`
-	OwnerDisplayName string   `json:"ownerDisplayName,omitempty"`
-	AllowUsers       []string `json:"allowUsers"`
-	StaticToken      string   `json:"staticToken,omitempty"`
-	AdminToken       string   `json:"adminToken,omitempty"`
-	MaxEnvelopes     int      `json:"maxEnvelopes"`
-	MaxBlobMB        int64    `json:"maxBlobMB"`
-	BlobTTLDays      int      `json:"blobTTLDays"`
-	UpdatedAtMs      int64    `json:"updatedAtMs"`
+	Initialized        bool     `json:"initialized"`
+	SiteName           string   `json:"siteName"`
+	AuthMode           string   `json:"authMode"` // "xtags_owner" | "xtags_multi" | "static_token"
+	AuthAPI            string   `json:"authAPI"`
+	OwnerUserID        string   `json:"ownerUserID,omitempty"`
+	OwnerDisplayName   string   `json:"ownerDisplayName,omitempty"`
+	AllowUsers         []string `json:"allowUsers"`
+	StaticToken        string   `json:"staticToken,omitempty"`
+	AdminToken         string   `json:"adminToken,omitempty"`
+	MaxEnvelopes       int      `json:"maxEnvelopes"`
+	MaxBlobMB          int64    `json:"maxBlobMB"`
+	BlobTTLDays        int      `json:"blobTTLDays"`
+	MaxTmpFileMB       int64    `json:"maxTmpFileMB"`
+	MaxTmpTotalMB      int64    `json:"maxTmpTotalMB"`
+	TmpTTLHours        int      `json:"tmpTTLHours"`
+	TmpAckGraceMinutes int      `json:"tmpAckGraceMinutes"`
+	UpdatedAtMs        int64    `json:"updatedAtMs"`
 }
 
 func (s *RelayServer) configFilePath() string {
@@ -51,16 +55,20 @@ func (s *RelayServer) initDynamicConfig(authToken, xtagsAuthAPI, allowUsersCSV s
 	}
 
 	cfg := DynamicRelayConfig{
-		Initialized:  envConfigured,
-		SiteName:     "SyncNow Relay",
-		AuthMode:     mode,
-		AuthAPI:      strings.TrimRight(strings.TrimSpace(xtagsAuthAPI), "/"),
-		AllowUsers:   allowList,
-		StaticToken:  strings.TrimSpace(authToken),
-		AdminToken:   strings.TrimSpace(s.adminToken),
-		MaxEnvelopes: s.maxEnvelopes,
-		MaxBlobMB:    maxInt64(1, s.maxBlobBytes/(1024*1024)),
-		BlobTTLDays:  maxInt(1, int(s.blobTTL/(24*time.Hour))),
+		Initialized:        envConfigured,
+		SiteName:           "SyncNow Relay",
+		AuthMode:           mode,
+		AuthAPI:            strings.TrimRight(strings.TrimSpace(xtagsAuthAPI), "/"),
+		AllowUsers:         allowList,
+		StaticToken:        strings.TrimSpace(authToken),
+		AdminToken:         strings.TrimSpace(s.adminToken),
+		MaxEnvelopes:       s.maxEnvelopes,
+		MaxBlobMB:          maxInt64(1, s.maxBlobBytes/(1024*1024)),
+		BlobTTLDays:        maxInt(1, int(s.blobTTL/(24*time.Hour))),
+		MaxTmpFileMB:       envInt64OrDefault("SYNCNOW_MAX_TMP_FILE_MB", 1024),
+		MaxTmpTotalMB:      envInt64OrDefault("SYNCNOW_MAX_TMP_TOTAL_MB", 8192),
+		TmpTTLHours:        envIntOrDefault("SYNCNOW_TMP_TTL_HOURS", 12),
+		TmpAckGraceMinutes: envIntAllowNegOrDefault("SYNCNOW_TMP_ACK_GRACE_MINUTES", 30),
 	}
 	if len(allowList) > 0 {
 		cfg.OwnerUserID = allowList[0]
@@ -92,6 +100,25 @@ func (s *RelayServer) applyDynamicConfigLocked(cfg DynamicRelayConfig) {
 	}
 	if cfg.BlobTTLDays <= 0 {
 		cfg.BlobTTLDays = 7
+	}
+	if cfg.MaxTmpFileMB <= 0 {
+		cfg.MaxTmpFileMB = 1024
+	}
+	if cfg.MaxTmpTotalMB <= 0 {
+		cfg.MaxTmpTotalMB = 8192
+	}
+	if cfg.MaxTmpTotalMB < cfg.MaxTmpFileMB {
+		cfg.MaxTmpTotalMB = cfg.MaxTmpFileMB
+	}
+	if cfg.TmpTTLHours <= 0 {
+		cfg.TmpTTLHours = 12
+	}
+	if cfg.TmpAckGraceMinutes == 0 && cfg.UpdatedAtMs == 0 {
+		// Default 30 minutes grace on legacy configs missing this field; explicit 0 after save means immediate burn
+		cfg.TmpAckGraceMinutes = 30
+	}
+	if cfg.TmpAckGraceMinutes < -1 {
+		cfg.TmpAckGraceMinutes = -1
 	}
 	s.cfg = cfg
 	s.maxEnvelopes = cfg.MaxEnvelopes
@@ -246,19 +273,25 @@ func (s *RelayServer) handleSetupStatus(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	cfg := s.currentConfig()
+	runtimeName := detectGoRuntimeName()
 	if !cfg.Initialized {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"initialized":  false,
-			"runtime":      "go-self-hosted",
-			"version":      relayVersion,
-			"siteName":     cfg.SiteName,
-			"authMode":     cfg.AuthMode,
-			"authAPI":      cfg.AuthAPI,
-			"maxEnvelopes": cfg.MaxEnvelopes,
-			"maxBlobMB":    cfg.MaxBlobMB,
-			"blobTTLDays":  cfg.BlobTTLDays,
-			"r2Enabled":    false,
-			"isAdmin":      false,
+			"initialized":        false,
+			"runtime":            runtimeName,
+			"storageBackend":     "disk",
+			"version":            relayVersion,
+			"siteName":           cfg.SiteName,
+			"authMode":           cfg.AuthMode,
+			"authAPI":            cfg.AuthAPI,
+			"maxEnvelopes":       cfg.MaxEnvelopes,
+			"maxBlobMB":          cfg.MaxBlobMB,
+			"blobTTLDays":        cfg.BlobTTLDays,
+			"maxTmpFileMB":       cfg.MaxTmpFileMB,
+			"maxTmpTotalMB":      cfg.MaxTmpTotalMB,
+			"tmpTTLHours":        cfg.TmpTTLHours,
+			"tmpAckGraceMinutes": cfg.TmpAckGraceMinutes,
+			"r2Enabled":          false,
+			"isAdmin":            false,
 		})
 		return
 	}
@@ -274,22 +307,30 @@ func (s *RelayServer) handleSetupStatus(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"initialized":      true,
-		"runtime":          "go-self-hosted",
-		"version":          relayVersion,
-		"siteName":         cfg.SiteName,
-		"authMode":         cfg.AuthMode,
-		"authAPI":          cfg.AuthAPI,
-		"ownerDisplayName": cfg.OwnerDisplayName,
-		"ownerUserID":      cfg.OwnerUserID,
-		"ownerLocked":      cfg.AuthMode == "xtags_owner" && len(cfg.AllowUsers) > 0,
-		"allowUsersCount":  len(cfg.AllowUsers),
-		"allowUsers":       cfg.AllowUsers,
-		"maxEnvelopes":     cfg.MaxEnvelopes,
-		"maxBlobMB":        cfg.MaxBlobMB,
-		"blobTTLDays":      cfg.BlobTTLDays,
-		"r2Enabled":        false,
-		"isAdmin":          true,
+		"initialized":        true,
+		"runtime":            runtimeName,
+		"storageBackend":     "disk",
+		"dataDir":            s.dataDir,
+		"version":            relayVersion,
+		"siteName":           cfg.SiteName,
+		"authMode":           cfg.AuthMode,
+		"authAPI":            cfg.AuthAPI,
+		"ownerDisplayName":   cfg.OwnerDisplayName,
+		"ownerUserID":        cfg.OwnerUserID,
+		"ownerLocked":        cfg.AuthMode == "xtags_owner" && len(cfg.AllowUsers) > 0,
+		"allowUsersCount":    len(cfg.AllowUsers),
+		"allowUsers":         cfg.AllowUsers,
+		"maxEnvelopes":       cfg.MaxEnvelopes,
+		"maxBlobMB":          cfg.MaxBlobMB,
+		"blobTTLDays":        cfg.BlobTTLDays,
+		"maxTmpFileMB":       cfg.MaxTmpFileMB,
+		"maxTmpTotalMB":      cfg.MaxTmpTotalMB,
+		"tmpTTLHours":        cfg.TmpTTLHours,
+		"tmpAckGraceMinutes": cfg.TmpAckGraceMinutes,
+		"tmpStats":           s.tmpBlobs.Stats(cfg),
+		"deviceTokens":       s.deviceTokens.ListPublic(),
+		"r2Enabled":          false,
+		"isAdmin":            true,
 	})
 }
 
@@ -408,16 +449,20 @@ func (s *RelayServer) handleSetupComplete(w http.ResponseWriter, r *http.Request
 	}
 
 	var req struct {
-		SiteName     string   `json:"siteName"`
-		AuthMode     string   `json:"authMode"`
-		AuthAPI      string   `json:"authAPI"`
-		XTagsToken   string   `json:"xtagsToken"`
-		AllowUsers   []string `json:"allowUsers"`
-		StaticToken  string   `json:"staticToken"`
-		AdminToken   string   `json:"adminToken"`
-		MaxEnvelopes int      `json:"maxEnvelopes"`
-		MaxBlobMB    int64    `json:"maxBlobMB"`
-		BlobTTLDays  int      `json:"blobTTLDays"`
+		SiteName           string   `json:"siteName"`
+		AuthMode           string   `json:"authMode"`
+		AuthAPI            string   `json:"authAPI"`
+		XTagsToken         string   `json:"xtagsToken"`
+		AllowUsers         []string `json:"allowUsers"`
+		StaticToken        string   `json:"staticToken"`
+		AdminToken         string   `json:"adminToken"`
+		MaxEnvelopes       int      `json:"maxEnvelopes"`
+		MaxBlobMB          int64    `json:"maxBlobMB"`
+		BlobTTLDays        int      `json:"blobTTLDays"`
+		MaxTmpFileMB       int64    `json:"maxTmpFileMB"`
+		MaxTmpTotalMB      int64    `json:"maxTmpTotalMB"`
+		TmpTTLHours        int      `json:"tmpTTLHours"`
+		TmpAckGraceMinutes *int     `json:"tmpAckGraceMinutes"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_json", "invalid json payload")
@@ -444,6 +489,21 @@ func (s *RelayServer) handleSetupComplete(w http.ResponseWriter, r *http.Request
 	}
 	if req.BlobTTLDays > 0 && req.BlobTTLDays <= 365 {
 		next.BlobTTLDays = req.BlobTTLDays
+	}
+	if req.MaxTmpFileMB >= 1 && req.MaxTmpFileMB <= 102400 {
+		next.MaxTmpFileMB = req.MaxTmpFileMB
+	}
+	if req.MaxTmpTotalMB >= 1 && req.MaxTmpTotalMB <= 1024000 {
+		next.MaxTmpTotalMB = req.MaxTmpTotalMB
+	}
+	if req.TmpTTLHours >= 1 && req.TmpTTLHours <= 720 {
+		next.TmpTTLHours = req.TmpTTLHours
+	}
+	if req.TmpAckGraceMinutes != nil && *req.TmpAckGraceMinutes >= -1 && *req.TmpAckGraceMinutes <= 10080 {
+		next.TmpAckGraceMinutes = *req.TmpAckGraceMinutes
+	}
+	if next.MaxTmpTotalMB < next.MaxTmpFileMB {
+		next.MaxTmpTotalMB = next.MaxTmpFileMB
 	}
 	if strings.TrimSpace(req.AdminToken) != "" {
 		next.AdminToken = strings.TrimSpace(req.AdminToken)
@@ -506,6 +566,83 @@ func (s *RelayServer) handleSetupComplete(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+func (s *RelayServer) handleSetupTmpPolicy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.isRequestSetupAdmin(r.Context(), r) {
+		writeAPIError(w, http.StatusUnauthorized, "unauthorized", "admin authentication required")
+		return
+	}
+	var req struct {
+		MaxEnvelopes       *int   `json:"maxEnvelopes"`
+		MaxBlobMB          *int64 `json:"maxBlobMB"`
+		BlobTTLDays        *int   `json:"blobTTLDays"`
+		MaxTmpFileMB       *int64 `json:"maxTmpFileMB"`
+		MaxTmpTotalMB      *int64 `json:"maxTmpTotalMB"`
+		TmpTTLHours        *int   `json:"tmpTTLHours"`
+		TmpAckGraceMinutes *int   `json:"tmpAckGraceMinutes"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 32*1024)).Decode(&req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_json", "invalid json payload")
+		return
+	}
+
+	next := s.currentConfig()
+	if req.MaxEnvelopes != nil && *req.MaxEnvelopes >= 10 && *req.MaxEnvelopes <= 5000 {
+		next.MaxEnvelopes = *req.MaxEnvelopes
+	}
+	if req.MaxBlobMB != nil && *req.MaxBlobMB >= 1 && *req.MaxBlobMB <= 512 {
+		next.MaxBlobMB = *req.MaxBlobMB
+	}
+	if req.BlobTTLDays != nil && *req.BlobTTLDays >= 1 && *req.BlobTTLDays <= 365 {
+		next.BlobTTLDays = *req.BlobTTLDays
+	}
+	if req.MaxTmpFileMB != nil && *req.MaxTmpFileMB >= 1 && *req.MaxTmpFileMB <= 102400 {
+		next.MaxTmpFileMB = *req.MaxTmpFileMB
+	}
+	if req.MaxTmpTotalMB != nil && *req.MaxTmpTotalMB >= 1 && *req.MaxTmpTotalMB <= 1024000 {
+		next.MaxTmpTotalMB = *req.MaxTmpTotalMB
+	}
+	if req.TmpTTLHours != nil && *req.TmpTTLHours >= 1 && *req.TmpTTLHours <= 720 {
+		next.TmpTTLHours = *req.TmpTTLHours
+	}
+	if req.TmpAckGraceMinutes != nil && *req.TmpAckGraceMinutes >= -1 && *req.TmpAckGraceMinutes <= 10080 {
+		next.TmpAckGraceMinutes = *req.TmpAckGraceMinutes
+	}
+	if next.MaxTmpTotalMB < next.MaxTmpFileMB {
+		next.MaxTmpTotalMB = next.MaxTmpFileMB
+	}
+
+	if err := s.saveDynamicConfig(next); err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "save_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"tmpStats": s.tmpBlobs.Stats(s.currentConfig()),
+	})
+}
+
+func (s *RelayServer) handleSetupPurgeTmp(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.isRequestSetupAdmin(r.Context(), r) {
+		writeAPIError(w, http.StatusUnauthorized, "unauthorized", "admin authentication required")
+		return
+	}
+	purgedCount, freedBytes := s.tmpBlobs.PurgeAll()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":          true,
+		"purgedCount": purgedCount,
+		"freedBytes":  freedBytes,
+		"tmpStats":    s.tmpBlobs.Stats(s.currentConfig()),
+	})
+}
+
 func (s *RelayServer) handleSetupReset(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -516,14 +653,19 @@ func (s *RelayServer) handleSetupReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = os.Remove(s.configFilePath())
+	s.deviceTokens.ClearAll()
 	resetCfg := DynamicRelayConfig{
-		Initialized:  false,
-		SiteName:     "SyncNow Relay",
-		AuthMode:     "xtags_owner",
-		AuthAPI:      defaultXTagsAuthAPI,
-		MaxEnvelopes: 500,
-		MaxBlobMB:    25,
-		BlobTTLDays:  7,
+		Initialized:        false,
+		SiteName:           "SyncNow Relay",
+		AuthMode:           "xtags_owner",
+		AuthAPI:            defaultXTagsAuthAPI,
+		MaxEnvelopes:       500,
+		MaxBlobMB:          25,
+		BlobTTLDays:        7,
+		MaxTmpFileMB:       1024,
+		MaxTmpTotalMB:      8192,
+		TmpTTLHours:        12,
+		TmpAckGraceMinutes: 30,
 	}
 	s.cfgMu.Lock()
 	s.applyDynamicConfigLocked(resetCfg)

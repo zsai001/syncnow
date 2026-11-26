@@ -3,18 +3,25 @@ import {
   constantTimeEqual,
   extractBearerToken,
   invalidateConfigCache,
+  invalidateDeviceTokenCache,
   isSetupAdmin,
   loadRuntimeConfig,
   verifyOrExchangeXTags,
+  verifyTmpTicket,
 } from './auth.ts';
 import { SETUP_UI_HTML } from './setup_ui.ts';
 import {
   apiError,
+  DEFAULT_TMP_CHUNK_PLAIN_BYTES,
   jsonResponse,
+  MAX_TMP_CHUNKS_PER_TRANSFER,
   RELAY_VERSION,
   SAFE_ID_REGEX,
+  type DeviceTokenRecord,
   type DynamicRelayConfig,
   type Env,
+  type TmpStatsSummary,
+  type TmpTicketClaims,
 } from './types.ts';
 
 export { MetaStoreDO, RelayGroupDO, SignalingRoomDO } from './objects.ts';
@@ -25,7 +32,7 @@ function withCORS(request: Request, response: Response): Response {
   const headers = new Headers(response.headers);
   headers.set('Access-Control-Allow-Origin', origin);
   headers.set('Vary', 'Origin');
-  headers.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+  headers.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-SyncNow-Ticket, Range');
   headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   return new Response(response.body, {
     status: response.status,
@@ -77,9 +84,286 @@ function withQuotaHeaders(request: Request, cfg: DynamicRelayConfig, bodyText?: 
   return new Request(request, { headers });
 }
 
+function expectedPartCipherLen(claims: TmpTicketClaims, partIdx: number): number {
+  if (partIdx < 0 || partIdx >= claims.totalChunks) return -1;
+  if (partIdx < claims.totalChunks - 1) return claims.chunkCipher;
+  return claims.totalCipher - (claims.totalChunks - 1) * claims.chunkCipher;
+}
+
+async function resolveTmpClaimsForRead(
+  request: Request,
+  env: Env,
+  transferID: string,
+  groupHash: string,
+): Promise<{ claims?: TmpTicketClaims; errorResponse?: Response }> {
+  const url = new URL(request.url);
+  const rawTicket =
+    (request.headers.get('X-SyncNow-Ticket') || url.searchParams.get('ticket') || '').trim();
+  if (rawTicket) {
+    const verified = await verifyTmpTicket(env, rawTicket, transferID, groupHash || undefined);
+    if (verified) return { claims: verified };
+  }
+  const authRes = await authenticateRequest(request, env);
+  if (!authRes.principal) {
+    return { errorResponse: authRes.errorResponse || apiError(401, 'unauthorized', 'unauthorized') };
+  }
+  const metaStub = env.META_STORE.get(env.META_STORE.idFromName('global'));
+  const lookupRes = await metaStub.fetch(
+    `https://internal/internal/tmp/lookup/${transferID}?group=${encodeURIComponent(groupHash)}`,
+  );
+  if (!lookupRes.ok) {
+    return { errorResponse: lookupRes };
+  }
+  const claims = (await lookupRes.json()) as TmpTicketClaims;
+  return { claims };
+}
+
+async function handleEdgeTmpRoutes(request: Request, env: Env, url: URL): Promise<Response> {
+  const path = url.pathname;
+  const metaStub = env.META_STORE.get(env.META_STORE.idFromName('global'));
+
+  if (path === '/v1/tmp/init' && request.method === 'POST') {
+    const authRes = await authenticateRequest(request, env);
+    if (!authRes.principal) {
+      return authRes.errorResponse || apiError(401, 'unauthorized', 'unauthorized');
+    }
+    const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body) return apiError(400, 'invalid_json', 'invalid json payload');
+    if (
+      !SAFE_ID_REGEX.test(String(body.transferID || '')) ||
+      !SAFE_ID_REGEX.test(String(body.groupHash || ''))
+    ) {
+      return apiError(400, 'invalid_params', 'valid transferID and groupHash are required');
+    }
+    return metaStub.fetch('https://internal/internal/tmp/init', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, cfg: authRes.cfg }),
+    });
+  }
+
+  const rest = path.slice('/v1/tmp/'.length);
+  const segs = rest.split('/');
+  const transferID = segs[0] || '';
+  if (!SAFE_ID_REGEX.test(transferID)) {
+    return apiError(400, 'invalid_transfer_id', 'valid transferID is required');
+  }
+  const groupHash = (url.searchParams.get('group') || '').trim();
+
+  // Single-segment GET (full stream / HTTP Range) or DELETE
+  if (segs.length === 1) {
+    if (request.method === 'DELETE') {
+      const authRes = await authenticateRequest(request, env);
+      if (!authRes.principal) {
+        return authRes.errorResponse || apiError(401, 'unauthorized', 'unauthorized');
+      }
+      return metaStub.fetch(
+        `https://internal/internal/tmp/${transferID}?group=${encodeURIComponent(groupHash)}`,
+        { method: 'DELETE' },
+      );
+    }
+
+    if (request.method === 'GET') {
+      const { claims, errorResponse } = await resolveTmpClaimsForRead(
+        request,
+        env,
+        transferID,
+        groupHash,
+      );
+      if (!claims) return errorResponse!;
+
+      // Fast Path: Stream directly from Cloudflare R2 at the Edge without touching any Durable Object!
+      if (claims.backend === 'r2' && env.BLOBS) {
+        const rangeHdr = request.headers.get('Range');
+        if (rangeHdr && rangeHdr.startsWith('bytes=')) {
+          const [startStr, endStr] = rangeHdr.slice(6).split('-');
+          const start = Number(startStr || '0');
+          const end = endStr ? Number(endStr) : claims.totalCipher - 1;
+          if (Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end >= start) {
+            const length = Math.min(end, claims.totalCipher - 1) - start + 1;
+            const obj = await env.BLOBS.get(claims.r2Key, { range: { offset: start, length } });
+            if (!obj) return apiError(404, 'not_found', 'tmp blob not found');
+            return new Response(obj.body, {
+              status: 206,
+              headers: {
+                'Content-Type': 'application/octet-stream',
+                'Content-Length': String(length),
+                'Content-Range': `bytes ${start}-${start + length - 1}/${claims.totalCipher}`,
+                'Accept-Ranges': 'bytes',
+              },
+            });
+          }
+        }
+        const obj = await env.BLOBS.get(claims.r2Key);
+        if (!obj) return apiError(404, 'not_found', 'tmp blob not found');
+        return new Response(obj.body, {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(obj.size),
+            'Accept-Ranges': 'bytes',
+          },
+        });
+      }
+
+      const groupStub = env.RELAY_GROUP.get(env.RELAY_GROUP.idFromName(claims.grp));
+      return groupStub.fetch(
+        `https://internal/internal/do-tmp/${transferID}?totalChunks=${claims.totalChunks}&totalCipher=${claims.totalCipher}`,
+      );
+    }
+    return apiError(405, 'method_not_allowed', 'method not allowed');
+  }
+
+  // POST /v1/tmp/:id/complete
+  if (segs.length === 2 && segs[1] === 'complete' && request.method === 'POST') {
+    const authRes = await authenticateRequest(request, env);
+    if (!authRes.principal) {
+      return authRes.errorResponse || apiError(401, 'unauthorized', 'unauthorized');
+    }
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+    return metaStub.fetch('https://internal/internal/tmp/complete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, transferID }),
+    });
+  }
+
+  // POST /v1/tmp/:id/ack
+  if (segs.length === 2 && segs[1] === 'ack' && request.method === 'POST') {
+    const authRes = await authenticateRequest(request, env);
+    if (!authRes.principal) {
+      return authRes.errorResponse || apiError(401, 'unauthorized', 'unauthorized');
+    }
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+    return metaStub.fetch('https://internal/internal/tmp/ack', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...body,
+        transferID,
+        ackGraceMinutes: authRes.cfg.tmpAckGraceMinutes,
+      }),
+    });
+  }
+
+  // PUT/GET /v1/tmp/:id/parts/:idx
+  if (segs.length === 3 && segs[1] === 'parts') {
+    const partIdx = Number(segs[2]);
+    if (!Number.isInteger(partIdx) || partIdx < 0 || partIdx >= MAX_TMP_CHUNKS_PER_TRANSFER) {
+      return apiError(400, 'invalid_part', 'invalid part index');
+    }
+
+    if (request.method === 'PUT' || request.method === 'POST') {
+      const rawTicket =
+        (request.headers.get('X-SyncNow-Ticket') || url.searchParams.get('ticket') || '').trim();
+      let claims = rawTicket
+        ? await verifyTmpTicket(env, rawTicket, transferID, groupHash || undefined)
+        : null;
+      if (!claims) {
+        return apiError(401, 'invalid_ticket', 'valid X-SyncNow-Ticket is required for part upload');
+      }
+      const wantLen = expectedPartCipherLen(claims, partIdx);
+      if (wantLen <= 0) {
+        return apiError(400, 'invalid_part', 'part index out of range');
+      }
+      const clHeader = request.headers.get('Content-Length');
+      if (clHeader && Number(clHeader) !== wantLen) {
+        return apiError(
+          400,
+          'part_size_mismatch',
+          `expected ${wantLen} bytes, got ${clHeader}`,
+        );
+      }
+
+      // Edge-Direct R2 upload (zero bytes pass through Durable Objects!)
+      if (claims.backend === 'r2' && env.BLOBS) {
+        if (!request.body) return apiError(400, 'empty_body', 'empty upload body');
+        let etag = '';
+        if (claims.totalChunks === 1) {
+          const data = new Uint8Array(await request.arrayBuffer());
+          if (data.byteLength !== wantLen) {
+            return apiError(
+              400,
+              'part_size_mismatch',
+              `expected ${wantLen} bytes, got ${data.byteLength}`,
+            );
+          }
+          const obj = await env.BLOBS.put(claims.r2Key, data, {
+            httpMetadata: { contentType: 'application/octet-stream' },
+          });
+          etag = obj.etag;
+        } else {
+          if (!claims.uploadId) {
+            return apiError(400, 'missing_upload_id', 'missing R2 multipart uploadId');
+          }
+          const mpu = env.BLOBS.resumeMultipartUpload(claims.r2Key, claims.uploadId);
+          const uploaded = await mpu.uploadPart(partIdx + 1, request.body);
+          etag = uploaded.etag;
+        }
+        // Record lightweight part etag in MetaStoreDO for resumable `init` / `complete`
+        await metaStub.fetch('https://internal/internal/tmp/record-part', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ transferID, partIndex: partIdx, etag }),
+        });
+        return jsonResponse({ partIndex: partIdx, partNumber: partIdx + 1, etag });
+      }
+
+      // DO SQLite fallback when R2 is not bound
+      const groupStub = env.RELAY_GROUP.get(env.RELAY_GROUP.idFromName(claims.grp));
+      const doRes = await groupStub.fetch(
+        `https://internal/internal/do-tmp/${transferID}/parts/${partIdx}?expectedLen=${wantLen}`,
+        { method: 'PUT', body: request.body },
+      );
+      if (!doRes.ok) return doRes;
+      const partData = (await doRes.json()) as { partIndex: number; partNumber: number; etag: string };
+      await metaStub.fetch('https://internal/internal/tmp/record-part', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transferID, partIndex: partIdx, etag: partData.etag }),
+      });
+      return jsonResponse(partData);
+    }
+
+    if (request.method === 'GET') {
+      const { claims, errorResponse } = await resolveTmpClaimsForRead(
+        request,
+        env,
+        transferID,
+        groupHash,
+      );
+      if (!claims) return errorResponse!;
+      const partLen = expectedPartCipherLen(claims, partIdx);
+      if (partLen <= 0) return apiError(400, 'invalid_part', 'part index out of range');
+
+      if (claims.backend === 'r2' && env.BLOBS) {
+        const offset = partIdx * claims.chunkCipher;
+        const obj = await env.BLOBS.get(claims.r2Key, { range: { offset, length: partLen } });
+        if (!obj) return apiError(404, 'not_found', 'tmp part not found');
+        return new Response(obj.body, {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(partLen),
+          },
+        });
+      }
+
+      const groupStub = env.RELAY_GROUP.get(env.RELAY_GROUP.idFromName(claims.grp));
+      return groupStub.fetch(`https://internal/internal/do-tmp/${transferID}/parts/${partIdx}`);
+    }
+  }
+
+  return apiError(404, 'not_found', 'Not found');
+}
+
 async function handleRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
+
+  if (path === '/ping' && request.method === 'GET') {
+    return jsonResponse({ ok: true });
+  }
 
   if (path === '/favicon.ico' && request.method === 'GET') {
     return new Response(null, {
@@ -99,8 +383,6 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     });
   }
 
-  // 0. Default-deny root `/` once initialized; browsers with Accept: text/html receive the
-  // zero-leak static Web Console shell on HTTP 401 so unlocked sessions and unlock UI work smoothly.
   if (path === '/' && request.method === 'GET') {
     const cfg = await loadRuntimeConfig(env);
     if (!cfg.initialized) {
@@ -162,10 +444,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
   if (path === '/v1/setup/status' && request.method === 'GET') {
     const cfg = await loadRuntimeConfig(env, true);
+    const storageBackend = env.BLOBS ? 'r2' : 'do_sqlite';
     if (!cfg.initialized) {
       return jsonResponse({
         initialized: false,
         runtime: 'cloudflare-workers',
+        storageBackend,
         version: RELAY_VERSION,
         siteName: cfg.siteName,
         authMode: cfg.authMode,
@@ -173,6 +457,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         maxEnvelopes: cfg.maxEnvelopes,
         maxBlobMB: cfg.maxBlobMB,
         blobTTLDays: cfg.blobTTLDays,
+        maxTmpFileMB: cfg.maxTmpFileMB,
+        maxTmpTotalMB: cfg.maxTmpTotalMB,
+        tmpTTLHours: cfg.tmpTTLHours,
+        tmpAckGraceMinutes: cfg.tmpAckGraceMinutes,
         r2Enabled: Boolean(env.BLOBS),
         isAdmin: false,
       });
@@ -195,9 +483,21 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         },
       );
     }
+    const metaStub = env.META_STORE.get(env.META_STORE.idFromName('global'));
+    const summaryRes = await metaStub.fetch('https://internal/internal/admin-summary', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cfg),
+    });
+    const summary = (await summaryRes.json()) as {
+      tmpStats: TmpStatsSummary;
+      deviceTokens: DeviceTokenRecord[];
+    };
+
     return jsonResponse({
       initialized: true,
       runtime: 'cloudflare-workers',
+      storageBackend,
       version: RELAY_VERSION,
       siteName: cfg.siteName,
       authMode: cfg.authMode,
@@ -210,6 +510,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       maxEnvelopes: cfg.maxEnvelopes,
       maxBlobMB: cfg.maxBlobMB,
       blobTTLDays: cfg.blobTTLDays,
+      maxTmpFileMB: cfg.maxTmpFileMB,
+      maxTmpTotalMB: cfg.maxTmpTotalMB,
+      tmpTTLHours: cfg.tmpTTLHours,
+      tmpAckGraceMinutes: cfg.tmpAckGraceMinutes,
+      tmpStats: summary.tmpStats,
+      deviceTokens: summary.deviceTokens,
       r2Enabled: Boolean(env.BLOBS),
       isAdmin: true,
     });
@@ -317,6 +623,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       maxEnvelopes?: number;
       maxBlobMB?: number;
       blobTTLDays?: number;
+      maxTmpFileMB?: number;
+      maxTmpTotalMB?: number;
+      tmpTTLHours?: number;
+      tmpAckGraceMinutes?: number;
     } | null;
     if (!req) return apiError(400, 'invalid_json', 'invalid json payload');
 
@@ -324,6 +634,16 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     if (mode !== 'xtags_owner' && mode !== 'xtags_multi' && mode !== 'static_token') {
       return apiError(400, 'invalid_mode', 'authMode must be xtags_owner, xtags_multi, or static_token');
     }
+
+    const maxTmpFileCup = env.BLOBS ? 102400 : 512;
+    const maxTmpFileMB =
+      req.maxTmpFileMB && req.maxTmpFileMB >= 1 && req.maxTmpFileMB <= maxTmpFileCup
+        ? req.maxTmpFileMB
+        : cfg.maxTmpFileMB;
+    const rawTmpTotalMB =
+      req.maxTmpTotalMB && req.maxTmpTotalMB >= 1 && req.maxTmpTotalMB <= 1024000
+        ? req.maxTmpTotalMB
+        : cfg.maxTmpTotalMB;
 
     const next: DynamicRelayConfig = {
       ...cfg,
@@ -342,6 +662,19 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         req.blobTTLDays && req.blobTTLDays > 0 && req.blobTTLDays <= 365
           ? req.blobTTLDays
           : cfg.blobTTLDays,
+      maxTmpFileMB,
+      maxTmpTotalMB: Math.max(maxTmpFileMB, rawTmpTotalMB),
+      tmpTTLHours:
+        req.tmpTTLHours && req.tmpTTLHours >= 1 && req.tmpTTLHours <= 720
+          ? req.tmpTTLHours
+          : cfg.tmpTTLHours,
+      tmpAckGraceMinutes:
+        req.tmpAckGraceMinutes !== undefined &&
+        Number.isFinite(req.tmpAckGraceMinutes) &&
+        req.tmpAckGraceMinutes >= -1 &&
+        req.tmpAckGraceMinutes <= 10080
+          ? req.tmpAckGraceMinutes
+          : cfg.tmpAckGraceMinutes,
       updatedAtMs: Date.now(),
     };
     if (req.adminToken && req.adminToken.trim()) {
@@ -395,6 +728,74 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return jsonResponse({ ok: true });
   }
 
+  if (path === '/v1/setup/tmp-policy' && request.method === 'POST') {
+    const cfg = await loadRuntimeConfig(env, true);
+    if (!(await isSetupAdmin(request, cfg))) {
+      return apiError(401, 'unauthorized', 'admin authentication required');
+    }
+    const req = (await request.json().catch(() => null)) as Partial<DynamicRelayConfig> | null;
+    if (!req) return apiError(400, 'invalid_json', 'invalid json payload');
+
+    const maxTmpFileCap = env.BLOBS ? 102400 : 512;
+    const next: DynamicRelayConfig = { ...cfg, updatedAtMs: Date.now() };
+    if (req.maxEnvelopes && req.maxEnvelopes >= 10 && req.maxEnvelopes <= 5000) {
+      next.maxEnvelopes = req.maxEnvelopes;
+    }
+    if (req.maxBlobMB && req.maxBlobMB >= 1 && req.maxBlobMB <= 512) {
+      next.maxBlobMB = req.maxBlobMB;
+    }
+    if (req.blobTTLDays && req.blobTTLDays >= 1 && req.blobTTLDays <= 365) {
+      next.blobTTLDays = req.blobTTLDays;
+    }
+    if (req.maxTmpFileMB && req.maxTmpFileMB >= 1 && req.maxTmpFileMB <= maxTmpFileCap) {
+      next.maxTmpFileMB = req.maxTmpFileMB;
+    }
+    if (req.maxTmpTotalMB && req.maxTmpTotalMB >= 1 && req.maxTmpTotalMB <= 1024000) {
+      next.maxTmpTotalMB = req.maxTmpTotalMB;
+    }
+    if (req.tmpTTLHours && req.tmpTTLHours >= 1 && req.tmpTTLHours <= 720) {
+      next.tmpTTLHours = req.tmpTTLHours;
+    }
+    if (
+      req.tmpAckGraceMinutes !== undefined &&
+      Number.isFinite(req.tmpAckGraceMinutes) &&
+      req.tmpAckGraceMinutes >= -1 &&
+      req.tmpAckGraceMinutes <= 10080
+    ) {
+      next.tmpAckGraceMinutes = req.tmpAckGraceMinutes;
+    }
+    next.maxTmpTotalMB = Math.max(next.maxTmpFileMB, next.maxTmpTotalMB);
+
+    const metaStub = env.META_STORE.get(env.META_STORE.idFromName('global'));
+    await metaStub.fetch('https://internal/internal/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(next),
+    });
+    invalidateConfigCache();
+
+    const summaryRes = await metaStub.fetch('https://internal/internal/admin-summary', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(next),
+    });
+    const summary = (await summaryRes.json()) as { tmpStats: TmpStatsSummary };
+    return jsonResponse({ ok: true, tmpStats: summary.tmpStats });
+  }
+
+  if (path === '/v1/setup/purge-tmp' && request.method === 'POST') {
+    const cfg = await loadRuntimeConfig(env, true);
+    if (!(await isSetupAdmin(request, cfg))) {
+      return apiError(401, 'unauthorized', 'admin authentication required');
+    }
+    const metaStub = env.META_STORE.get(env.META_STORE.idFromName('global'));
+    return metaStub.fetch('https://internal/internal/purge-tmp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cfg),
+    });
+  }
+
   if (path === '/v1/setup/reset' && request.method === 'POST') {
     const cfg = await loadRuntimeConfig(env, true);
     if (!(await isSetupAdmin(request, cfg))) {
@@ -403,10 +804,68 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     const metaStub = env.META_STORE.get(env.META_STORE.idFromName('global'));
     await metaStub.fetch('https://internal/internal/config', { method: 'DELETE' });
     invalidateConfigCache();
+    invalidateDeviceTokenCache();
     return jsonResponse({ ok: true });
   }
 
-  // 1. Health check (requires valid client auth or admin token; compatible with SyncNow "Test Connection")
+  // Scoped Device Tokens (`snr_dev_...`)
+  if (path === '/v1/auth/device-tokens' || path.startsWith('/v1/auth/device-tokens/')) {
+    const cfg = await loadRuntimeConfig(env);
+    const metaStub = env.META_STORE.get(env.META_STORE.idFromName('global'));
+
+    if (path.startsWith('/v1/auth/device-tokens/')) {
+      if (request.method !== 'DELETE') return apiError(405, 'method_not_allowed', 'method not allowed');
+      if (!(await isSetupAdmin(request, cfg))) {
+        return apiError(401, 'unauthorized', 'admin authentication required');
+      }
+      const id = path.slice('/v1/auth/device-tokens/'.length);
+      if (!SAFE_ID_REGEX.test(id)) return apiError(400, 'invalid_id', 'invalid token id');
+      const res = await metaStub.fetch(`https://internal/internal/device-tokens/${id}`, {
+        method: 'DELETE',
+      });
+      invalidateDeviceTokenCache();
+      return res;
+    }
+
+    if (request.method === 'GET') {
+      if (!(await isSetupAdmin(request, cfg))) {
+        return apiError(401, 'unauthorized', 'admin authentication required');
+      }
+      return metaStub.fetch('https://internal/internal/device-tokens');
+    }
+
+    if (request.method === 'POST') {
+      let roomID = '';
+      if (await isSetupAdmin(request, cfg)) {
+        roomID = cfg.ownerUserID || 'static-owner';
+      } else {
+        const authRes = await authenticateRequest(request, env);
+        if (!authRes.principal) {
+          return authRes.errorResponse || apiError(401, 'unauthorized', 'unauthorized');
+        }
+        if (authRes.principal.mode === 'device_token' || authRes.principal.mode === 'open') {
+          return apiError(403, 'forbidden', 'scoped device tokens cannot mint new tokens');
+        }
+        roomID = authRes.principal.roomID;
+      }
+      const reqBody = (await request.json().catch(() => ({}))) as {
+        label?: string;
+        ttlDays?: number;
+      };
+      return metaStub.fetch('https://internal/internal/device-tokens/issue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          label: reqBody.label,
+          ttlDays: reqBody.ttlDays,
+          roomID,
+        }),
+      });
+    }
+    return apiError(405, 'method_not_allowed', 'method not allowed');
+  }
+
+  // Health check
   if (path === '/health') {
     const authRes = await authenticateRequest(request, env);
     const { cfg } = authRes;
@@ -428,7 +887,16 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       ? { id: principal.user.id, displayName: principal.user.displayName }
       : undefined;
 
-    const capabilities = ['e2ee_relay', 'e2ee_blobs', 'same_account_signaling', 'updates', 'web_setup'];
+    const capabilities = [
+      'e2ee_relay',
+      'e2ee_blobs',
+      'tmp_chunked_blobs',
+      'same_account_signaling',
+      'group_key_vault',
+      'ws_peer_tunnel',
+      'device_tokens',
+      'web_setup',
+    ];
     if (authAPI) capabilities.push('xtags_auth');
     if (env.BLOBS) capabilities.push('r2_blobs');
 
@@ -436,23 +904,35 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       status: 'ok',
       service: 'syncnow-relay',
       runtime: 'cloudflare-workers',
+      storageBackend: env.BLOBS ? 'r2' : 'do_sqlite',
       version: RELAY_VERSION,
       initialized: cfg.initialized,
       xtagsAuth: Boolean(authAPI),
       ownerLocked: cfg.authMode === 'xtags_owner' && cfg.allowUsers.length > 0,
       authenticated: principal.mode !== 'open',
+      authMode: principal.mode,
+      maxBlobMB: cfg.maxBlobMB,
+      maxTmpFileMB: cfg.maxTmpFileMB,
+      maxTmpTotalMB: cfg.maxTmpTotalMB,
+      tmpTTLHours: cfg.tmpTTLHours,
+      tmpAckGraceMinutes: cfg.tmpAckGraceMinutes,
+      tmpChunkPlainBytes: DEFAULT_TMP_CHUNK_PLAIN_BYTES,
       user: userSummary,
       capabilities,
     });
   }
 
-  // 2. Auto-Update / Force-Update public check (no auth required)
+  // Chunked streaming Tmp Large File routes (`/v1/tmp/*`)
+  if (path.startsWith('/v1/tmp/')) {
+    return handleEdgeTmpRoutes(request, env, url);
+  }
+
+  // Legacy update routes
   if (path === '/v1/updates/check') {
     const metaStub = env.META_STORE.get(env.META_STORE.idFromName('global'));
     return metaStub.fetch(request);
   }
 
-  // 3. Admin release manifest publish
   if (path === '/v1/admin/updates') {
     const cfg = await loadRuntimeConfig(env);
     const expectedAdmin = (cfg.adminToken || cfg.staticToken || '').trim();
@@ -466,8 +946,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return metaStub.fetch(request);
   }
 
-  // 4. All data & signaling routes require valid xtags.top Bearer token (or static token)
-  //    Admin token is also accepted on read-only `/v1/signal/peers` for the Web Console.
+  // Data, Signaling, Group Vault & Tunnel routes require valid auth
   const authRes = await authenticateRequest(request, env);
   const { cfg } = authRes;
   let { principal } = authRes;
@@ -485,8 +964,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return authRes.errorResponse || apiError(401, 'unauthorized', 'unauthorized');
   }
 
-  // 5. Same-Account Signaling & Peer Matching (isolated strictly by verified xtags userID!)
-  if (path === '/v1/signal/ws' || path === '/v1/signal/peers') {
+  if (
+    path === '/v1/signal/ws' ||
+    path === '/v1/signal/peers' ||
+    path === '/v1/signal/group-vault' ||
+    path === '/v1/tunnel/ws'
+  ) {
     const roomStub = env.SIGNALING_ROOM.get(env.SIGNALING_ROOM.idFromName(principal.roomID));
     const fwdHeaders = new Headers(request.headers);
     fwdHeaders.set('X-SyncNow-Room-ID', principal.roomID);
@@ -494,7 +977,6 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return roomStub.fetch(fwdReq);
   }
 
-  // 6. E2EE Clipboard Relay & Encrypted File Blobs (isolated by groupHash)
   if (path === '/ws' || path === '/v1/sync' || path.startsWith('/v1/blobs/')) {
     const groupHash = (url.searchParams.get('group') || '').trim();
     if (!SAFE_ID_REGEX.test(groupHash)) {

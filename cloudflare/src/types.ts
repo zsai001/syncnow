@@ -11,6 +11,10 @@ export interface Env {
   SYNCNOW_MAX_ENVELOPES?: string;
   SYNCNOW_MAX_BLOB_MB?: string;
   SYNCNOW_BLOB_TTL_DAYS?: string;
+  SYNCNOW_MAX_TMP_FILE_MB?: string;
+  SYNCNOW_MAX_TMP_TOTAL_MB?: string;
+  SYNCNOW_TMP_TTL_HOURS?: string;
+  SYNCNOW_TMP_ACK_GRACE_MINUTES?: string;
 }
 
 export interface XTagsUser {
@@ -25,7 +29,18 @@ export interface XTagsUser {
 export interface AuthPrincipal {
   roomID: string;
   user: XTagsUser | null;
-  mode: 'xtags' | 'static_token' | 'open';
+  mode: 'xtags' | 'device_token' | 'static_token' | 'open';
+}
+
+export interface DeviceTokenRecord {
+  id: string;
+  label: string;
+  tokenHash?: string;
+  tokenPreview: string;
+  roomID: string;
+  createdAtMs: number;
+  expiresAtMs?: number;
+  lastUsedAtMs?: number;
 }
 
 export interface Envelope {
@@ -50,6 +65,8 @@ export interface SignalPeerPresence {
   deviceName: string;
   platform: string;
   signingPublicKeyBase64: string;
+  x25519PublicKeyBase64?: string;
+  x25519SignatureBase64?: string;
   accountCert?: unknown;
   lanEndpoints: SignalEndpoint[];
   observedPublicIP?: string;
@@ -58,6 +75,30 @@ export interface SignalPeerPresence {
   appVersion: string;
   online: boolean;
   updatedAtMs: number;
+}
+
+export interface KnownAccountDevice {
+  deviceID: string;
+  deviceName: string;
+  platform: string;
+  signingPublicKeyBase64: string;
+  x25519PublicKeyBase64?: string;
+  x25519SignatureBase64?: string;
+  accountCert?: unknown;
+  updatedAtMs: number;
+}
+
+export interface SealedGroupKeyEnvelope {
+  targetDeviceID: string;
+  senderDeviceID: string;
+  senderSigningPublicKeyBase64: string;
+  senderAccountCert?: unknown;
+  ephemeralX25519PubBase64: string;
+  ciphertextBase64: string;
+  groupHash: string;
+  keyUpdatedAtMs: number;
+  signatureBase64: string;
+  createdAtMs: number;
 }
 
 export interface SignalClientMessage {
@@ -110,11 +151,42 @@ export interface DynamicRelayConfig {
   maxEnvelopes: number;
   maxBlobMB: number;
   blobTTLDays: number;
+  maxTmpFileMB: number;
+  maxTmpTotalMB: number;
+  tmpTTLHours: number;
+  tmpAckGraceMinutes: number;
   updatedAtMs: number;
 }
 
+export interface TmpStatsSummary {
+  storageBackend: 'r2' | 'do_sqlite' | 'disk';
+  activeFiles: number;
+  uploadingFiles: number;
+  usedBytes: number;
+  maxTmpFileMB: number;
+  maxTmpTotalMB: number;
+  tmpTTLHours: number;
+  tmpAckGraceMinutes: number;
+}
+
+export interface TmpTicketClaims {
+  tid: string;
+  grp: string;
+  backend: 'r2' | 'do_sqlite';
+  r2Key: string;
+  uploadId?: string;
+  chunkCipher: number;
+  totalCipher: number;
+  totalChunks: number;
+  exp: number;
+}
+
 export const SAFE_ID_REGEX = /^[a-zA-Z0-9._-]{1,128}$/;
-export const RELAY_VERSION = '0.3.2';
+export const RELAY_VERSION = '0.4.0';
+export const DEVICE_TOKEN_PREFIX = 'snr_dev_';
+export const DEFAULT_TMP_CHUNK_PLAIN_BYTES = 8 * 1024 * 1024;
+export const TMP_CHUNK_AEAD_TAG_BYTES = 16;
+export const MAX_TMP_CHUNKS_PER_TRANSFER = 2048;
 
 export function jsonResponse(payload: unknown, status = 200, extraHeaders?: HeadersInit): Response {
   const headers = new Headers(extraHeaders);
